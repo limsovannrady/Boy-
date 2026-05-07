@@ -1061,8 +1061,6 @@ BTN_CLONE_BOT_SET     = "✏️ កំណត់ Bot Token"
 BTN_CLONE_BOT_STOP    = "⛔ បិទ Clone Bot"
 BTN_CLONE_BOT_START   = "▶️ បើក Clone Bot"
 
-BTN_NEON_DB           = "🗄 Neon Database"
-BTN_NEON_DB_EDIT      = "✏️ ប្តូរ Neon Database URL"
 
 ADMIN_BUTTON_LABELS = {
     BTN_ADD_ACCOUNT, BTN_DELETE_TYPE, BTN_STOCK, BTN_USERS, BTN_BUYERS,
@@ -1073,7 +1071,6 @@ ADMIN_BUTTON_LABELS = {
     BTN_EMAIL_MGMT, BTN_EMAIL_NEW, BTN_EMAIL_LIST, BTN_EMAIL_DELETE,
     BTN_EMAIL_TOKEN_EDIT, BTN_EMAIL_TOKEN_INFO,
     BTN_CLONE_BOT, BTN_CLONE_BOT_SET, BTN_CLONE_BOT_STOP, BTN_CLONE_BOT_START,
-    BTN_NEON_DB, BTN_NEON_DB_EDIT,
 }
 
 MAIN_KB = ReplyKeyboardMarkup(
@@ -1091,7 +1088,7 @@ ADMIN_SETTINGS_KB = ReplyKeyboardMarkup([
     [KeyboardButton(BTN_PAYMENT),      KeyboardButton(BTN_BAKONG)],
     [KeyboardButton(BTN_CHANNEL),      KeyboardButton(BTN_ADMINS)],
     [KeyboardButton(BTN_MAINTENANCE),  KeyboardButton(BTN_BROADCAST)],
-    [KeyboardButton(BTN_NEON_DB),      KeyboardButton(BTN_CLONE_BOT)],
+    [KeyboardButton(BTN_CLONE_BOT)],
 ], resize_keyboard=True, is_persistent=True)
 
 CANCEL_INPUT_KB = ReplyKeyboardMarkup(
@@ -1146,10 +1143,6 @@ CLONE_BOT_SUBMENU_KB = ReplyKeyboardMarkup([
     [KeyboardButton(BTN_BACK_SETTINGS)],
 ], resize_keyboard=True, is_persistent=True)
 
-NEON_DB_SUBMENU_KB = ReplyKeyboardMarkup([
-    [KeyboardButton(BTN_NEON_DB_EDIT)],
-    [KeyboardButton(BTN_BACK_SETTINGS)],
-], resize_keyboard=True, is_persistent=True)
 
 CHECK_PAYMENT_INLINE = InlineKeyboardMarkup([
     [InlineKeyboardButton("🚫 បោះបង់", callback_data="cancel_purchase")]
@@ -1872,26 +1865,6 @@ async def _show_clone_bot_inline(chat_id):
         reply_markup=CLONE_BOT_SUBMENU_KB)
 
 
-async def _show_neon_db_inline(chat_id):
-    if NEON_DATABASE_URL:
-        parsed = urlparse(NEON_DATABASE_URL)
-        host = parsed.hostname or "?"
-        user = parsed.username or "?"
-        db   = (parsed.path or "/").lstrip("/") or "?"
-        display = f"<code>{html.escape(user)}@{html.escape(host)}/{html.escape(db)}</code>"
-        status = "🟢 ភ្ជាប់រួច"
-    else:
-        display = "<i>(មិនទាន់កំណត់ — ប្រើ local file storage)</i>"
-        status = "🟡 Local file"
-    await send_msg(
-        chat_id,
-        f"🗄 <b>Neon Database</b>\n\n"
-        f"ស្ថានភាព: {status}\n"
-        f"URL: {display}\n\n"
-        f"<i>URL ត្រូវចាប់ផ្ដើម <code>postgresql://</code> ។ "
-        f"ឧទាហរណ៍: <code>postgresql://user:pass@host/db?sslmode=require</code></i>",
-        reply_markup=NEON_DB_SUBMENU_KB)
-
 
 async def _clone_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for the admin clone bot — all private messages."""
@@ -2280,13 +2253,6 @@ async def _dispatch_admin_button(bot_instance, user_id, chat_id, btn):
                 "<i>⚠️ Token នឹងត្រូវបានលុបចោលស្វ័យប្រវត្តិ — ផ្ញើដោយប្រុងប្រយ័ត្ន!</i>")
         elif btn == BTN_EMAIL_TOKEN_INFO:
             await _email_show_token_info(chat_id)
-        elif btn == BTN_NEON_DB:
-            await _show_neon_db_inline(chat_id)
-        elif btn == BTN_NEON_DB_EDIT:
-            await _prompt_admin_input(
-                chat_id, user_id, "neon_db",
-                "🗄 សូមផ្ញើ <b>Neon Database URL</b> ថ្មី:\n\n"
-                "<i>ឧទាហរណ៍: <code>postgresql://user:pass@host/db?sslmode=require</code></i>")
         elif btn == BTN_CLONE_BOT:
             await _show_clone_bot_inline(chat_id)
         elif btn == BTN_CLONE_BOT_SET:
@@ -2468,39 +2434,6 @@ async def _handle_admin_settings_input(chat_id, user_id, message_id, key, text):
         await send_msg(chat_id, "⏳ កំពុងភ្ជាប់ Clone Bot Admin…", reply_markup=ADMIN_SETTINGS_KB)
         result_msg = await _start_admin_clone_bot(raw)
         await send_msg(chat_id, result_msg, reply_markup=CLONE_BOT_SUBMENU_KB)
-        return True
-
-    if key == "neon_db":
-        if not raw:
-            await send_msg(chat_id, "🗄 សូមផ្ញើ <b>Neon Database URL</b> (ឬចុច 🚫 បោះបង់)")
-            return True
-        if not raw.startswith("postgresql://") and not raw.startswith("postgres://"):
-            await send_msg(chat_id,
-                "❌ URL មិនត្រឹមត្រូវ — ត្រូវចាប់ផ្ដើម <code>postgresql://</code> "
-                "ឬ <code>postgres://</code>")
-            return True
-        await run_sync(_reinit_neon, raw)
-        await run_sync(_set_setting, "NEON_DATABASE_URL", raw)
-        asyncio.create_task(delete_msg(chat_id, message_id))
-        async with _data_lock:
-            user_sessions.pop(user_id, None)
-        asyncio.create_task(run_sync(_save_sessions))
-        await send_msg(chat_id, "⏳ កំពុងភ្ជាប់ Neon Database…", reply_markup=ADMIN_SETTINGS_KB)
-        try:
-            await run_sync(_init_db)
-            data = await run_sync(_load_data)
-            accounts_data.update(data)
-            await run_sync(_load_sessions)
-            await send_msg(
-                chat_id,
-                f"✅ <b>ភ្ជាប់ Neon Database ជោគជ័យ!</b>\n\n"
-                f"Host: <code>{html.escape(urlparse(raw).hostname or '?')}</code>\n"
-                f"<i>Data + sessions បានផ្ទុកពី Neon។</i>",
-                reply_markup=NEON_DB_SUBMENU_KB)
-        except Exception as e:
-            await send_msg(chat_id,
-                f"⚠️ ភ្ជាប់ Neon ជោគជ័យ ប៉ុន្តែ DB init failed: <code>{html.escape(str(e))}</code>",
-                reply_markup=NEON_DB_SUBMENU_KB)
         return True
 
     return False
