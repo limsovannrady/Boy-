@@ -144,13 +144,13 @@ def is_admin(uid) -> bool:
 
 # ── 4. Blocking HTTP session (DB + Bakong, run in thread pool) ────────────────
 _retry = Retry(
-    total=3, backoff_factor=0.3,
+    total=3, backoff_factor=0.5,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["GET", "POST"], raise_on_status=False,
 )
-_adapter = HTTPAdapter(max_retries=_retry, pool_connections=20, pool_maxsize=50)
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20)
 http = requests.Session()
-http.headers.update({"Connection": "keep-alive"})
+http.headers.update({"Connection": "keep-alive", "Accept-Encoding": "gzip, deflate"})
 http.mount("https://", _adapter)
 http.mount("http://",  _adapter)
 
@@ -3575,6 +3575,8 @@ async def _email_poller(interval: int = 10):
 
 
 async def _resume_scheduled_deletions():
+    if not _has_neon():
+        return
     try:
         r = await run_sync(
             _neon_query,
@@ -3730,7 +3732,17 @@ async def _on_startup():
 async def _run():
     global application, bot
 
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .read_timeout(20)
+        .write_timeout(20)
+        .connect_timeout(15)
+        .pool_timeout(15)
+        .get_updates_read_timeout(30)
+        .concurrent_updates(True)
+        .build()
+    )
     bot = application.bot
 
     _register_handlers(application)
