@@ -1,7 +1,7 @@
 # Telegram Bot — Bakong KHQR Payments
 
 ## Overview
-A Python Telegram bot that accepts orders, generates Bakong KHQR payment QR codes, and tracks state in a Neon Postgres database via its HTTP `/sql` API. Single-file implementation in `telegram_bot_simple.py`.
+A Python Telegram bot that accepts orders, generates Bakong KHQR payment QR codes, and tracks state in a Neon Postgres database via its HTTP `/sql` API. Single-file implementation in `boy.py`.
 
 ## Stack
 - **Python 3.11**
