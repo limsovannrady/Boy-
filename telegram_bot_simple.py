@@ -106,33 +106,6 @@ khqr_client        = KHQR(BAKONG_TOKEN) if BAKONG_TOKEN else None
 DROPMAIL_API_TOKEN = os.environ.get("DROPMAIL_API_TOKEN", "")
 _DROPMAIL_URL      = f"https://dropmail.me/api/graphql/{DROPMAIL_API_TOKEN}" if DROPMAIL_API_TOKEN else ""
 
-# ── Local config file (persists settings without Neon DB) ─────────────────────
-_CONFIG_FILE         = "bot_config.json"
-_LOCAL_DATA_FILE     = "bot_data_local.json"
-_LOCAL_SESSIONS_FILE = "bot_sessions_local.json"
-_LOCAL_PENDING_FILE  = "bot_pending_local.json"
-
-
-def _load_config_file() -> dict:
-    """Load all settings from local JSON file (bootstrap before Neon is configured)."""
-    try:
-        if os.path.exists(_CONFIG_FILE):
-            with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        logger.error(f"_load_config_file failed: {e}")
-    return {}
-
-
-def _save_config_file(key: str, value: str):
-    """Persist a single setting to the local config file."""
-    try:
-        cfg = _load_config_file()
-        cfg[key] = value
-        with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"_save_config_file({key}) failed: {e}")
 
 
 def is_admin(uid) -> bool:
@@ -387,15 +360,11 @@ def _get_setting(key, default=None):
                 return val
         except Exception as e:
             logger.error(f"Failed to read setting {key} from Neon: {e}")
-    val = _load_config_file().get(key, default)
-    if val is not None:
-        cache.set(f"setting:{key}", str(val), ttl=300)
-    return val
+    return default
 
 
 def _set_setting(key, value):
     cache.set(f"setting:{key}", str(value), ttl=300)
-    _save_config_file(key, str(value))
     if _has_neon():
         try:
             _neon_query("""
@@ -418,23 +387,10 @@ def _load_data():
                 return data
         except Exception as e:
             logger.error(f"Failed to load data from Neon: {e}")
-    try:
-        if os.path.exists(_LOCAL_DATA_FILE):
-            with open(_LOCAL_DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            logger.info("Loaded accounts data from local file")
-            return data
-    except Exception as e:
-        logger.error(f"Failed to load local data file: {e}")
     return {"accounts": [], "account_types": {}, "prices": {}}
 
 
 def _save_data():
-    try:
-        with open(_LOCAL_DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(accounts_data, f, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"Failed to save local data file: {e}")
     if _has_neon():
         try:
             _neon_query("UPDATE bot_accounts SET data = $1",
@@ -457,23 +413,10 @@ def _load_sessions():
                 return
         except Exception as e:
             logger.error(f"Failed to load sessions from Neon: {e}")
-    try:
-        if os.path.exists(_LOCAL_SESSIONS_FILE):
-            with open(_LOCAL_SESSIONS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            user_sessions = {int(k): v for k, v in data.items()}
-            logger.info("Loaded sessions from local file")
-    except Exception as e:
-        logger.error(f"Failed to load local sessions file: {e}")
 
 
 def _save_sessions():
     payload = {str(k): v for k, v in user_sessions.items()}
-    try:
-        with open(_LOCAL_SESSIONS_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"Failed to save local sessions file: {e}")
     if _has_neon():
         try:
             encoded = json.dumps(payload, ensure_ascii=False).replace("'", "''")
@@ -692,24 +635,6 @@ def _email_history_get_by_email(user_id: int, email_address: str) -> dict:
         return {}
 
 
-def _local_pending_load() -> dict:
-    try:
-        if os.path.exists(_LOCAL_PENDING_FILE):
-            with open(_LOCAL_PENDING_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
-
-
-def _local_pending_save(data: dict):
-    try:
-        with open(_LOCAL_PENDING_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"_local_pending_save failed: {e}")
-
-
 def _save_pending_payment(user_id, chat_id, session):
     reserved = session.get("reserved_accounts") or []
     if _has_neon():
@@ -729,18 +654,8 @@ def _save_pending_payment(user_id, chat_id, session):
                   str(session.get("qr_message_id", 0)),
                   json.dumps(reserved, ensure_ascii=False)])
             logger.info(f"Saved pending payment for user {user_id}")
-            return
         except Exception as e:
             logger.error(f"Failed to save pending payment to Neon: {e}")
-    pending = _local_pending_load()
-    pending[str(user_id)] = {
-        "chat_id": chat_id, "account_type": session.get("account_type"),
-        "quantity": session.get("quantity", 1), "total_price": session.get("total_price", 0),
-        "md5_hash": session.get("md5_hash"), "qr_message_id": session.get("qr_message_id", 0),
-        "reserved_accounts": reserved, "created_at": time.time(),
-    }
-    _local_pending_save(pending)
-    logger.info(f"Saved pending payment for user {user_id} (local)")
 
 
 def _delete_pending_payment(user_id):
@@ -750,10 +665,6 @@ def _delete_pending_payment(user_id):
             logger.info(f"Deleted pending payment for user {user_id}")
         except Exception as e:
             logger.error(f"Failed to delete pending payment from Neon: {e}")
-    pending = _local_pending_load()
-    if str(user_id) in pending:
-        del pending[str(user_id)]
-        _local_pending_save(pending)
 
 
 def _get_pending_payment(user_id):
@@ -780,19 +691,6 @@ def _get_pending_payment(user_id):
                 }
         except Exception as e:
             logger.error(f"Failed to get pending payment from Neon: {e}")
-    row = _local_pending_load().get(str(user_id))
-    if row:
-        reserved = row.get("reserved_accounts") or []
-        return {
-            "state": "payment_pending",
-            "account_type": row.get("account_type"),
-            "quantity": int(row.get("quantity") or 1),
-            "total_price": float(row.get("total_price") or 0),
-            "md5_hash": row.get("md5_hash"),
-            "qr_message_id": int(row.get("qr_message_id") or 0),
-            "chat_id": int(row.get("chat_id") or 0),
-            "reserved_accounts": reserved,
-        }
     return None
 
 
@@ -918,15 +816,6 @@ def _filter_out_already_sold(user_id, reserved):
 
 def _cleanup_expired_pending_payments():
     if not _has_neon():
-        now = time.time()
-        pending = _local_pending_load()
-        expired_ids = [uid for uid, row in pending.items()
-                       if now - float(row.get("created_at", now)) > PAYMENT_TIMEOUT_SECONDS]
-        for uid in expired_ids:
-            del pending[uid]
-        if expired_ids:
-            _local_pending_save(pending)
-            logger.info(f"Cleaned {len(expired_ids)} expired local payment(s)")
         return
     try:
         r = _neon_query(
@@ -3623,26 +3512,6 @@ async def _on_startup():
     global accounts_data, PAYMENT_NAME, MAINTENANCE_MODE, CHANNEL_ID
     global BAKONG_TOKEN, BAKONG_RELAY_TOKEN, BAKONG_API_TOKEN, khqr_client, EXTRA_ADMIN_IDS
     global NEON_DATABASE_URL, DROPMAIL_API_TOKEN, _DROPMAIL_URL
-
-    # ── Bootstrap: load NEON_DATABASE_URL + tokens from local config file ──────
-    _local_cfg = _load_config_file()
-    _neon_url_from_cfg = _local_cfg.get("NEON_DATABASE_URL", "")
-    if _neon_url_from_cfg and not NEON_DATABASE_URL:
-        _reinit_neon(_neon_url_from_cfg)
-        logger.info(f"Loaded NEON_DATABASE_URL from local config: {_neon_host}")
-
-    _bakong_from_cfg = _local_cfg.get("BAKONG_API_TOKEN", "") or _local_cfg.get("BAKONG_TOKEN", "")
-    if _bakong_from_cfg and not BAKONG_API_TOKEN:
-        BAKONG_API_TOKEN = _bakong_from_cfg
-    _bakong_relay_from_cfg = _local_cfg.get("BAKONG_RELAY_TOKEN", "")
-    if _bakong_relay_from_cfg and not BAKONG_RELAY_TOKEN:
-        BAKONG_RELAY_TOKEN = _bakong_relay_from_cfg
-
-    _dropmail_from_cfg = _local_cfg.get("DROPMAIL_API_TOKEN", "")
-    if _dropmail_from_cfg and not DROPMAIL_API_TOKEN:
-        DROPMAIL_API_TOKEN = _dropmail_from_cfg
-        _DROPMAIL_URL = f"https://dropmail.me/api/graphql/{DROPMAIL_API_TOKEN}"
-        logger.info(f"Loaded DROPMAIL_API_TOKEN from local config: {DROPMAIL_API_TOKEN[:6]}…")
 
     await run_sync(_init_db)
 

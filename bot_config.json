@@ -1,4 +1,0 @@
-{
-  "NEON_DATABASE_URL": "postgresql://neondb_owner:npg_CUg3fWZNM9rc@ep-ancient-feather-a16d9z6v-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=req4uire&channel_binding=require",
-  "ADMIN_BOT_TOKEN": "8544972576:AAHHInVe12C4fZa99emblJ-ZafGhEJwooxg"
-}
