@@ -58,9 +58,6 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 # ── 2b. Environment Validation ────────────────────────────────────────────────
 _REQUIRED_ENV_VARS = {
     "TELEGRAM_BOT_TOKEN": "Bot token from @BotFather on Telegram",
-    "BAKONG_TOKEN":       "Bakong KHQR API token",
-    "NEON_DATABASE_URL":  "Neon Postgres connection string (postgresql://...)",
-    "DROPMAIL_API_TOKEN": "Dropmail API token from https://dropmail.me",
 }
 
 
@@ -107,7 +104,35 @@ BAKONG_TOKEN       = BAKONG_RELAY_TOKEN if BAKONG_RELAY_TOKEN else BAKONG_API_TO
 khqr_client        = KHQR(BAKONG_TOKEN) if BAKONG_TOKEN else None
 
 DROPMAIL_API_TOKEN = os.environ.get("DROPMAIL_API_TOKEN", "")
-_DROPMAIL_URL      = f"https://dropmail.me/api/graphql/{DROPMAIL_API_TOKEN}"
+_DROPMAIL_URL      = f"https://dropmail.me/api/graphql/{DROPMAIL_API_TOKEN}" if DROPMAIL_API_TOKEN else ""
+
+# ── Local config file (persists settings without Neon DB) ─────────────────────
+_CONFIG_FILE         = "bot_config.json"
+_LOCAL_DATA_FILE     = "bot_data_local.json"
+_LOCAL_SESSIONS_FILE = "bot_sessions_local.json"
+_LOCAL_PENDING_FILE  = "bot_pending_local.json"
+
+
+def _load_config_file() -> dict:
+    """Load all settings from local JSON file (bootstrap before Neon is configured)."""
+    try:
+        if os.path.exists(_CONFIG_FILE):
+            with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"_load_config_file failed: {e}")
+    return {}
+
+
+def _save_config_file(key: str, value: str):
+    """Persist a single setting to the local config file."""
+    try:
+        cfg = _load_config_file()
+        cfg[key] = value
+        with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"_save_config_file({key}) failed: {e}")
 
 
 def is_admin(uid) -> bool:
@@ -201,16 +226,47 @@ def _get_bot() -> Bot:
 
 # ── 8. Database layer (Neon HTTP API — synchronous, called via run_sync) ──────
 NEON_DATABASE_URL = os.environ.get("NEON_DATABASE_URL", "")
-_neon_host    = urlparse(NEON_DATABASE_URL).hostname if NEON_DATABASE_URL else ""
-_neon_api_url = f"https://{_neon_host}/sql"
-_neon_headers = {
-    "Neon-Connection-String": NEON_DATABASE_URL,
-    "Content-Type":  "application/json",
-    "Accept":        "application/json",
-}
+_neon_host    = ""
+_neon_api_url = ""
+_neon_headers: dict = {}
+
+
+def _reinit_neon(url: str):
+    """(Re-)initialize Neon connection from a URL string. Called at startup or when admin sets the URL."""
+    global NEON_DATABASE_URL, _neon_host, _neon_api_url, _neon_headers
+    NEON_DATABASE_URL = (url or "").strip()
+    if NEON_DATABASE_URL:
+        try:
+            host = urlparse(NEON_DATABASE_URL).hostname or ""
+            _neon_host    = host
+            _neon_api_url = f"https://{host}/sql"
+            _neon_headers = {
+                "Neon-Connection-String": NEON_DATABASE_URL,
+                "Content-Type":  "application/json",
+                "Accept":        "application/json",
+            }
+            logger.info(f"Neon initialized: {host}")
+        except Exception as e:
+            logger.error(f"_reinit_neon failed: {e}")
+            _neon_host = _neon_api_url = ""
+            _neon_headers = {}
+    else:
+        _neon_host = _neon_api_url = ""
+        _neon_headers = {}
+
+
+def _has_neon() -> bool:
+    """Return True when a valid Neon URL has been configured."""
+    return bool(NEON_DATABASE_URL and _neon_host and _neon_api_url)
+
+
+if NEON_DATABASE_URL:
+    _reinit_neon(NEON_DATABASE_URL)
 
 
 def _neon_query(query: str, params=None) -> dict:
+    if not _has_neon():
+        raise RuntimeError("Neon DB not configured")
     body = {"query": query}
     if params:
         body["params"] = [str(p) if p is not None else None for p in params]
@@ -220,6 +276,9 @@ def _neon_query(query: str, params=None) -> dict:
 
 
 def _init_db():
+    if not _has_neon():
+        logger.info("Neon DB not configured — skipping DB init, using local file storage.")
+        return
     try:
         _neon_query("""
             CREATE TABLE IF NOT EXISTS bot_accounts (
@@ -318,72 +377,109 @@ def _get_setting(key, default=None):
     cached = cache.get(f"setting:{key}")
     if cached is not None:
         return cached
-    try:
-        r = _neon_query("SELECT value FROM bot_settings WHERE key = $1", [key])
-        rows = r.get("rows", [])
-        val = rows[0].get("value") if rows else default
-        if val is not None:
-            cache.set(f"setting:{key}", val, ttl=300)
-        return val
-    except Exception as e:
-        logger.error(f"Failed to read setting {key}: {e}")
-        return default
+    if _has_neon():
+        try:
+            r = _neon_query("SELECT value FROM bot_settings WHERE key = $1", [key])
+            rows = r.get("rows", [])
+            val = rows[0].get("value") if rows else None
+            if val is not None:
+                cache.set(f"setting:{key}", val, ttl=300)
+                return val
+        except Exception as e:
+            logger.error(f"Failed to read setting {key} from Neon: {e}")
+    val = _load_config_file().get(key, default)
+    if val is not None:
+        cache.set(f"setting:{key}", str(val), ttl=300)
+    return val
 
 
 def _set_setting(key, value):
     cache.set(f"setting:{key}", str(value), ttl=300)
-    try:
-        _neon_query("""
-            INSERT INTO bot_settings (key, value) VALUES ($1, $2)
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-        """, [key, str(value)])
-    except Exception as e:
-        logger.error(f"Failed to save setting {key}: {e}")
+    _save_config_file(key, str(value))
+    if _has_neon():
+        try:
+            _neon_query("""
+                INSERT INTO bot_settings (key, value) VALUES ($1, $2)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, [key, str(value)])
+        except Exception as e:
+            logger.error(f"Failed to save setting {key} to Neon: {e}")
 
 
 def _load_data():
+    if _has_neon():
+        try:
+            r = _neon_query("SELECT data FROM bot_accounts LIMIT 1")
+            if r["rows"]:
+                data = r["rows"][0]["data"]
+                if isinstance(data, str):
+                    data = json.loads(data)
+                logger.info("Loaded accounts data from Neon DB")
+                return data
+        except Exception as e:
+            logger.error(f"Failed to load data from Neon: {e}")
     try:
-        r = _neon_query("SELECT data FROM bot_accounts LIMIT 1")
-        if r["rows"]:
-            data = r["rows"][0]["data"]
-            if isinstance(data, str):
-                data = json.loads(data)
-            logger.info("Loaded accounts data from Neon DB")
+        if os.path.exists(_LOCAL_DATA_FILE):
+            with open(_LOCAL_DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            logger.info("Loaded accounts data from local file")
             return data
     except Exception as e:
-        logger.error(f"Failed to load data: {e}")
+        logger.error(f"Failed to load local data file: {e}")
     return {"accounts": [], "account_types": {}, "prices": {}}
 
 
 def _save_data():
     try:
-        _neon_query("UPDATE bot_accounts SET data = $1",
-                    [json.dumps(accounts_data, ensure_ascii=False)])
+        with open(_LOCAL_DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(accounts_data, f, ensure_ascii=False)
     except Exception as e:
-        logger.error(f"Failed to save data: {e}")
+        logger.error(f"Failed to save local data file: {e}")
+    if _has_neon():
+        try:
+            _neon_query("UPDATE bot_accounts SET data = $1",
+                        [json.dumps(accounts_data, ensure_ascii=False)])
+        except Exception as e:
+            logger.error(f"Failed to save data to Neon: {e}")
 
 
 def _load_sessions():
     global user_sessions
+    if _has_neon():
+        try:
+            r = _neon_query("SELECT data FROM bot_sessions LIMIT 1")
+            if r["rows"]:
+                data = r["rows"][0]["data"]
+                if isinstance(data, str):
+                    data = json.loads(data)
+                user_sessions = {int(k): v for k, v in data.items()}
+                logger.info("Loaded sessions from Neon DB")
+                return
+        except Exception as e:
+            logger.error(f"Failed to load sessions from Neon: {e}")
     try:
-        r = _neon_query("SELECT data FROM bot_sessions LIMIT 1")
-        if r["rows"]:
-            data = r["rows"][0]["data"]
-            if isinstance(data, str):
-                data = json.loads(data)
+        if os.path.exists(_LOCAL_SESSIONS_FILE):
+            with open(_LOCAL_SESSIONS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
             user_sessions = {int(k): v for k, v in data.items()}
-            logger.info("Loaded sessions from Neon DB")
+            logger.info("Loaded sessions from local file")
     except Exception as e:
-        logger.error(f"Failed to load sessions: {e}")
+        logger.error(f"Failed to load local sessions file: {e}")
 
 
 def _save_sessions():
+    payload = {str(k): v for k, v in user_sessions.items()}
     try:
-        payload = {str(k): v for k, v in user_sessions.items()}
-        encoded = json.dumps(payload, ensure_ascii=False).replace("'", "''")
-        _neon_query(f"UPDATE bot_sessions SET data = '{encoded}'::jsonb")
+        with open(_LOCAL_SESSIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
     except Exception as e:
-        logger.error(f"Failed to save sessions: {e}")
+        logger.error(f"Failed to save local sessions file: {e}")
+    if _has_neon():
+        try:
+            encoded = json.dumps(payload, ensure_ascii=False).replace("'", "''")
+            _neon_query(f"UPDATE bot_sessions SET data = '{encoded}'::jsonb")
+        except Exception as e:
+            logger.error(f"Failed to save sessions to Neon: {e}")
 
 
 # ── Dropmail GraphQL API (blocking, called via run_sync) ──────────────────────
@@ -596,59 +692,107 @@ def _email_history_get_by_email(user_id: int, email_address: str) -> dict:
         return {}
 
 
-def _save_pending_payment(user_id, chat_id, session):
+def _local_pending_load() -> dict:
     try:
-        reserved = session.get("reserved_accounts") or []
-        _neon_query("""
-            INSERT INTO bot_pending_payments
-                (user_id, chat_id, account_type, quantity, total_price, md5_hash, qr_message_id, reserved_accounts)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            ON CONFLICT (user_id) DO UPDATE SET
-                chat_id=EXCLUDED.chat_id, account_type=EXCLUDED.account_type,
-                quantity=EXCLUDED.quantity, total_price=EXCLUDED.total_price,
-                md5_hash=EXCLUDED.md5_hash, qr_message_id=EXCLUDED.qr_message_id,
-                reserved_accounts=EXCLUDED.reserved_accounts, created_at=NOW()
-        """, [str(user_id), str(chat_id),
-              session.get("account_type"), str(session.get("quantity", 1)),
-              str(session.get("total_price", 0)), session.get("md5_hash"),
-              str(session.get("qr_message_id", 0)),
-              json.dumps(reserved, ensure_ascii=False)])
-        logger.info(f"Saved pending payment for user {user_id}")
+        if os.path.exists(_LOCAL_PENDING_FILE):
+            with open(_LOCAL_PENDING_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _local_pending_save(data: dict):
+    try:
+        with open(_LOCAL_PENDING_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
     except Exception as e:
-        logger.error(f"Failed to save pending payment: {e}")
+        logger.error(f"_local_pending_save failed: {e}")
+
+
+def _save_pending_payment(user_id, chat_id, session):
+    reserved = session.get("reserved_accounts") or []
+    if _has_neon():
+        try:
+            _neon_query("""
+                INSERT INTO bot_pending_payments
+                    (user_id, chat_id, account_type, quantity, total_price, md5_hash, qr_message_id, reserved_accounts)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    chat_id=EXCLUDED.chat_id, account_type=EXCLUDED.account_type,
+                    quantity=EXCLUDED.quantity, total_price=EXCLUDED.total_price,
+                    md5_hash=EXCLUDED.md5_hash, qr_message_id=EXCLUDED.qr_message_id,
+                    reserved_accounts=EXCLUDED.reserved_accounts, created_at=NOW()
+            """, [str(user_id), str(chat_id),
+                  session.get("account_type"), str(session.get("quantity", 1)),
+                  str(session.get("total_price", 0)), session.get("md5_hash"),
+                  str(session.get("qr_message_id", 0)),
+                  json.dumps(reserved, ensure_ascii=False)])
+            logger.info(f"Saved pending payment for user {user_id}")
+            return
+        except Exception as e:
+            logger.error(f"Failed to save pending payment to Neon: {e}")
+    pending = _local_pending_load()
+    pending[str(user_id)] = {
+        "chat_id": chat_id, "account_type": session.get("account_type"),
+        "quantity": session.get("quantity", 1), "total_price": session.get("total_price", 0),
+        "md5_hash": session.get("md5_hash"), "qr_message_id": session.get("qr_message_id", 0),
+        "reserved_accounts": reserved, "created_at": time.time(),
+    }
+    _local_pending_save(pending)
+    logger.info(f"Saved pending payment for user {user_id} (local)")
 
 
 def _delete_pending_payment(user_id):
-    try:
-        _neon_query("DELETE FROM bot_pending_payments WHERE user_id = $1", [str(user_id)])
-        logger.info(f"Deleted pending payment for user {user_id}")
-    except Exception as e:
-        logger.error(f"Failed to delete pending payment: {e}")
+    if _has_neon():
+        try:
+            _neon_query("DELETE FROM bot_pending_payments WHERE user_id = $1", [str(user_id)])
+            logger.info(f"Deleted pending payment for user {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to delete pending payment from Neon: {e}")
+    pending = _local_pending_load()
+    if str(user_id) in pending:
+        del pending[str(user_id)]
+        _local_pending_save(pending)
 
 
 def _get_pending_payment(user_id):
-    try:
-        r = _neon_query("SELECT * FROM bot_pending_payments WHERE user_id = $1", [str(user_id)])
-        if r["rows"]:
-            row = r["rows"][0]
-            reserved = row.get("reserved_accounts") or []
-            if isinstance(reserved, str):
-                try:
-                    reserved = json.loads(reserved)
-                except Exception:
-                    reserved = []
-            return {
-                "state": "payment_pending",
-                "account_type": row.get("account_type"),
-                "quantity": int(row.get("quantity") or 1),
-                "total_price": float(row.get("total_price") or 0),
-                "md5_hash": row.get("md5_hash"),
-                "qr_message_id": int(row.get("qr_message_id") or 0),
-                "chat_id": int(row.get("chat_id") or 0),
-                "reserved_accounts": reserved,
-            }
-    except Exception as e:
-        logger.error(f"Failed to get pending payment: {e}")
+    if _has_neon():
+        try:
+            r = _neon_query("SELECT * FROM bot_pending_payments WHERE user_id = $1", [str(user_id)])
+            if r["rows"]:
+                row = r["rows"][0]
+                reserved = row.get("reserved_accounts") or []
+                if isinstance(reserved, str):
+                    try:
+                        reserved = json.loads(reserved)
+                    except Exception:
+                        reserved = []
+                return {
+                    "state": "payment_pending",
+                    "account_type": row.get("account_type"),
+                    "quantity": int(row.get("quantity") or 1),
+                    "total_price": float(row.get("total_price") or 0),
+                    "md5_hash": row.get("md5_hash"),
+                    "qr_message_id": int(row.get("qr_message_id") or 0),
+                    "chat_id": int(row.get("chat_id") or 0),
+                    "reserved_accounts": reserved,
+                }
+        except Exception as e:
+            logger.error(f"Failed to get pending payment from Neon: {e}")
+    row = _local_pending_load().get(str(user_id))
+    if row:
+        reserved = row.get("reserved_accounts") or []
+        return {
+            "state": "payment_pending",
+            "account_type": row.get("account_type"),
+            "quantity": int(row.get("quantity") or 1),
+            "total_price": float(row.get("total_price") or 0),
+            "md5_hash": row.get("md5_hash"),
+            "qr_message_id": int(row.get("qr_message_id") or 0),
+            "chat_id": int(row.get("chat_id") or 0),
+            "reserved_accounts": reserved,
+        }
     return None
 
 
@@ -773,6 +917,17 @@ def _filter_out_already_sold(user_id, reserved):
 
 
 def _cleanup_expired_pending_payments():
+    if not _has_neon():
+        now = time.time()
+        pending = _local_pending_load()
+        expired_ids = [uid for uid, row in pending.items()
+                       if now - float(row.get("created_at", now)) > PAYMENT_TIMEOUT_SECONDS]
+        for uid in expired_ids:
+            del pending[uid]
+        if expired_ids:
+            _local_pending_save(pending)
+            logger.info(f"Cleaned {len(expired_ids)} expired local payment(s)")
+        return
     try:
         r = _neon_query(
             "SELECT user_id, account_type, reserved_accounts FROM bot_pending_payments "
@@ -1017,6 +1172,9 @@ BTN_CLONE_BOT_SET     = "✏️ កំណត់ Bot Token"
 BTN_CLONE_BOT_STOP    = "⛔ បិទ Clone Bot"
 BTN_CLONE_BOT_START   = "▶️ បើក Clone Bot"
 
+BTN_NEON_DB           = "🗄 Neon Database"
+BTN_NEON_DB_EDIT      = "✏️ ប្តូរ Neon Database URL"
+
 ADMIN_BUTTON_LABELS = {
     BTN_ADD_ACCOUNT, BTN_DELETE_TYPE, BTN_STOCK, BTN_USERS, BTN_BUYERS,
     BTN_PAYMENT, BTN_BAKONG, BTN_CHANNEL, BTN_ADMINS, BTN_MAINTENANCE, BTN_BROADCAST,
@@ -1026,6 +1184,7 @@ ADMIN_BUTTON_LABELS = {
     BTN_EMAIL_MGMT, BTN_EMAIL_NEW, BTN_EMAIL_LIST, BTN_EMAIL_DELETE,
     BTN_EMAIL_TOKEN_EDIT, BTN_EMAIL_TOKEN_INFO,
     BTN_CLONE_BOT, BTN_CLONE_BOT_SET, BTN_CLONE_BOT_STOP, BTN_CLONE_BOT_START,
+    BTN_NEON_DB, BTN_NEON_DB_EDIT,
 }
 
 MAIN_KB = ReplyKeyboardMarkup(
@@ -1043,7 +1202,7 @@ ADMIN_SETTINGS_KB = ReplyKeyboardMarkup([
     [KeyboardButton(BTN_PAYMENT),      KeyboardButton(BTN_BAKONG)],
     [KeyboardButton(BTN_CHANNEL),      KeyboardButton(BTN_ADMINS)],
     [KeyboardButton(BTN_MAINTENANCE),  KeyboardButton(BTN_BROADCAST)],
-    [KeyboardButton(BTN_CLONE_BOT)],
+    [KeyboardButton(BTN_NEON_DB),      KeyboardButton(BTN_CLONE_BOT)],
 ], resize_keyboard=True, is_persistent=True)
 
 CANCEL_INPUT_KB = ReplyKeyboardMarkup(
@@ -1095,6 +1254,11 @@ EMAIL_SUBMENU_KB = ReplyKeyboardMarkup([
 CLONE_BOT_SUBMENU_KB = ReplyKeyboardMarkup([
     [KeyboardButton(BTN_CLONE_BOT_SET)],
     [KeyboardButton(BTN_CLONE_BOT_STOP), KeyboardButton(BTN_CLONE_BOT_START)],
+    [KeyboardButton(BTN_BACK_SETTINGS)],
+], resize_keyboard=True, is_persistent=True)
+
+NEON_DB_SUBMENU_KB = ReplyKeyboardMarkup([
+    [KeyboardButton(BTN_NEON_DB_EDIT)],
     [KeyboardButton(BTN_BACK_SETTINGS)],
 ], resize_keyboard=True, is_persistent=True)
 
@@ -1819,6 +1983,27 @@ async def _show_clone_bot_inline(chat_id):
         reply_markup=CLONE_BOT_SUBMENU_KB)
 
 
+async def _show_neon_db_inline(chat_id):
+    if NEON_DATABASE_URL:
+        parsed = urlparse(NEON_DATABASE_URL)
+        host = parsed.hostname or "?"
+        user = parsed.username or "?"
+        db   = (parsed.path or "/").lstrip("/") or "?"
+        display = f"<code>{html.escape(user)}@{html.escape(host)}/{html.escape(db)}</code>"
+        status = "🟢 ភ្ជាប់រួច"
+    else:
+        display = "<i>(មិនទាន់កំណត់ — ប្រើ local file storage)</i>"
+        status = "🟡 Local file"
+    await send_msg(
+        chat_id,
+        f"🗄 <b>Neon Database</b>\n\n"
+        f"ស្ថានភាព: {status}\n"
+        f"URL: {display}\n\n"
+        f"<i>URL ត្រូវចាប់ផ្ដើម <code>postgresql://</code> ។ "
+        f"ឧទាហរណ៍: <code>postgresql://user:pass@host/db?sslmode=require</code></i>",
+        reply_markup=NEON_DB_SUBMENU_KB)
+
+
 async def _clone_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for the admin clone bot — all private messages."""
     message = update.effective_message
@@ -2206,6 +2391,13 @@ async def _dispatch_admin_button(bot_instance, user_id, chat_id, btn):
                 "<i>⚠️ Token នឹងត្រូវបានលុបចោលស្វ័យប្រវត្តិ — ផ្ញើដោយប្រុងប្រយ័ត្ន!</i>")
         elif btn == BTN_EMAIL_TOKEN_INFO:
             await _email_show_token_info(chat_id)
+        elif btn == BTN_NEON_DB:
+            await _show_neon_db_inline(chat_id)
+        elif btn == BTN_NEON_DB_EDIT:
+            await _prompt_admin_input(
+                chat_id, user_id, "neon_db",
+                "🗄 សូមផ្ញើ <b>Neon Database URL</b> ថ្មី:\n\n"
+                "<i>ឧទាហរណ៍: <code>postgresql://user:pass@host/db?sslmode=require</code></i>")
         elif btn == BTN_CLONE_BOT:
             await _show_clone_bot_inline(chat_id)
         elif btn == BTN_CLONE_BOT_SET:
@@ -2387,6 +2579,39 @@ async def _handle_admin_settings_input(chat_id, user_id, message_id, key, text):
         await send_msg(chat_id, "⏳ កំពុងភ្ជាប់ Clone Bot Admin…", reply_markup=ADMIN_SETTINGS_KB)
         result_msg = await _start_admin_clone_bot(raw)
         await send_msg(chat_id, result_msg, reply_markup=CLONE_BOT_SUBMENU_KB)
+        return True
+
+    if key == "neon_db":
+        if not raw:
+            await send_msg(chat_id, "🗄 សូមផ្ញើ <b>Neon Database URL</b> (ឬចុច 🚫 បោះបង់)")
+            return True
+        if not raw.startswith("postgresql://") and not raw.startswith("postgres://"):
+            await send_msg(chat_id,
+                "❌ URL មិនត្រឹមត្រូវ — ត្រូវចាប់ផ្ដើម <code>postgresql://</code> "
+                "ឬ <code>postgres://</code>")
+            return True
+        await run_sync(_reinit_neon, raw)
+        await run_sync(_set_setting, "NEON_DATABASE_URL", raw)
+        asyncio.create_task(delete_msg(chat_id, message_id))
+        async with _data_lock:
+            user_sessions.pop(user_id, None)
+        asyncio.create_task(run_sync(_save_sessions))
+        await send_msg(chat_id, "⏳ កំពុងភ្ជាប់ Neon Database…", reply_markup=ADMIN_SETTINGS_KB)
+        try:
+            await run_sync(_init_db)
+            data = await run_sync(_load_data)
+            accounts_data.update(data)
+            await run_sync(_load_sessions)
+            await send_msg(
+                chat_id,
+                f"✅ <b>ភ្ជាប់ Neon Database ជោគជ័យ!</b>\n\n"
+                f"Host: <code>{html.escape(urlparse(raw).hostname or '?')}</code>\n"
+                f"<i>Data + sessions បានផ្ទុកពី Neon។</i>",
+                reply_markup=NEON_DB_SUBMENU_KB)
+        except Exception as e:
+            await send_msg(chat_id,
+                f"⚠️ ភ្ជាប់ Neon ជោគជ័យ ប៉ុន្តែ DB init failed: <code>{html.escape(str(e))}</code>",
+                reply_markup=NEON_DB_SUBMENU_KB)
         return True
 
     return False
@@ -3395,6 +3620,27 @@ def _register_handlers(app: Application):
 async def _on_startup():
     global accounts_data, PAYMENT_NAME, MAINTENANCE_MODE, CHANNEL_ID
     global BAKONG_TOKEN, BAKONG_RELAY_TOKEN, BAKONG_API_TOKEN, khqr_client, EXTRA_ADMIN_IDS
+    global NEON_DATABASE_URL, DROPMAIL_API_TOKEN, _DROPMAIL_URL
+
+    # ── Bootstrap: load NEON_DATABASE_URL + tokens from local config file ──────
+    _local_cfg = _load_config_file()
+    _neon_url_from_cfg = _local_cfg.get("NEON_DATABASE_URL", "")
+    if _neon_url_from_cfg and not NEON_DATABASE_URL:
+        _reinit_neon(_neon_url_from_cfg)
+        logger.info(f"Loaded NEON_DATABASE_URL from local config: {_neon_host}")
+
+    _bakong_from_cfg = _local_cfg.get("BAKONG_API_TOKEN", "") or _local_cfg.get("BAKONG_TOKEN", "")
+    if _bakong_from_cfg and not BAKONG_API_TOKEN:
+        BAKONG_API_TOKEN = _bakong_from_cfg
+    _bakong_relay_from_cfg = _local_cfg.get("BAKONG_RELAY_TOKEN", "")
+    if _bakong_relay_from_cfg and not BAKONG_RELAY_TOKEN:
+        BAKONG_RELAY_TOKEN = _bakong_relay_from_cfg
+
+    _dropmail_from_cfg = _local_cfg.get("DROPMAIL_API_TOKEN", "")
+    if _dropmail_from_cfg and not DROPMAIL_API_TOKEN:
+        DROPMAIL_API_TOKEN = _dropmail_from_cfg
+        _DROPMAIL_URL = f"https://dropmail.me/api/graphql/{DROPMAIL_API_TOKEN}"
+        logger.info(f"Loaded DROPMAIL_API_TOKEN from local config: {DROPMAIL_API_TOKEN[:6]}…")
 
     await run_sync(_init_db)
 
@@ -3449,7 +3695,6 @@ async def _on_startup():
 
     _sv = await run_sync(_get_setting, "DROPMAIL_API_TOKEN")
     if _sv:
-        global DROPMAIL_API_TOKEN, _DROPMAIL_URL
         DROPMAIL_API_TOKEN = _sv
         _DROPMAIL_URL = f"https://dropmail.me/api/graphql/{DROPMAIL_API_TOKEN}"
         logger.info(f"Loaded DROPMAIL_API_TOKEN from DB: {DROPMAIL_API_TOKEN[:6]}…")
