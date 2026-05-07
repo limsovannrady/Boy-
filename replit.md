@@ -4,9 +4,9 @@
 A Python Telegram bot that accepts orders, generates Bakong KHQR payment QR codes, and tracks state in a Neon Postgres database via its HTTP `/sql` API. Single-file implementation in `boy.py`.
 
 ## Stack
-- **Python 3.11**
-- **python-telegram-bot v20+** (Bot API HTTP polling — no MTProto, no session file)
-- `bakong-khqr`, `requests`, `pillow`, `qrcode`, `urllib3`, `aiohttp`
+- **Python 3.11+**
+- **python-telegram-bot v22+** (Bot API HTTP polling)
+- `bakong-khqr`, `requests`, `pillow`, `qrcode`, `python-dotenv`
 - Neon Postgres (HTTP API, no driver required)
 
 ## Architecture
@@ -31,23 +31,13 @@ A Python Telegram bot that accepts orders, generates Bakong KHQR payment QR code
 | `on_private_message` (group 0) | All private non-command messages dispatcher |
 | `on_callback_query` | Inline keyboard callbacks |
 
-### Dispatcher Flow (`on_private_message`)
-1. Maintenance block (non-admin)
-2. Admin branch: settings btn → admin_input states → delete/broadcast/email states → button labels → account-management states
-3. Non-admin branch: payment_pending guard → show account selection
-
-## Required Secrets
-Stored in Replit Secrets (Tools → Secrets):
-- `TELEGRAM_BOT_TOKEN` — from BotFather (required)
-- `BAKONG_TOKEN` — Bakong KHQR API token (required)
-- `NEON_DATABASE_URL` — Neon Postgres connection string (required)
-- `DROPMAIL_API_TOKEN` — Dropmail API token (required)
-
-> **Note:** `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` are no longer needed — the bot uses Bot API (HTTP polling), not Pyrogram MTProto.
-
-## Run
-The `Telegram Bot` workflow runs `python3 telegram_bot_simple.py`.
-python-telegram-bot handles polling automatically — no webhook or session file needed.
+## Required Secrets / Environment Variables
+| Variable | Description |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather (required) |
+| `NEON_DATABASE_URL` | Neon Postgres connection string (required) |
+| `BAKONG_TOKEN` | Bakong KHQR API token |
+| `DROPMAIL_API_TOKEN` | Dropmail GraphQL API token |
 
 ## Admin-Managed Settings (persisted in `bot_settings` DB table)
 | Key | Description |
@@ -64,6 +54,61 @@ python-telegram-bot handles polling automatically — no webhook or session file
 ## Primary Admin
 Hardcoded: `ADMIN_ID = 5002402843`. Additional admins managed via the ⚙️ settings menu.
 
+---
+
+## Run on Replit
+The `Telegram Bot` workflow runs `python3 boy.py` automatically.
+
+---
+
+## Deploy on VPS (Ubuntu/Debian) — 24h
+
+### Step 1 — Upload files to VPS
+```bash
+scp boy.py requirements.txt setup.sh bot.service .env.example root@YOUR_VPS_IP:/root/bot_setup/
+```
+
+### Step 2 — Run setup script (SSH into VPS first)
+```bash
+ssh root@YOUR_VPS_IP
+cd /root/bot_setup
+bash setup.sh
+```
+
+### Step 3 — Fill in your secrets
+```bash
+nano /root/bot/.env
+```
+បំពេញ values ទាំងអស់ (copy from `.env.example`):
+```
+TELEGRAM_BOT_TOKEN=...
+NEON_DATABASE_URL=...
+BAKONG_TOKEN=...
+DROPMAIL_API_TOKEN=...
+```
+
+### Step 4 — Start the bot
+```bash
+systemctl start telegram-bot
+systemctl status telegram-bot
+```
+
+### Useful commands
+```bash
+# មើល logs live
+journalctl -u telegram-bot -f
+
+# Restart
+systemctl restart telegram-bot
+
+# Stop
+systemctl stop telegram-bot
+
+# Auto-start on reboot (already enabled by setup.sh)
+systemctl enable telegram-bot
+```
+
 ## User Preferences
 - Keep same code structure/format when migrating
 - Use python-telegram-bot (Bot API) not Pyrogram (MTProto)
+- All data stored in Neon DB only (no local files)

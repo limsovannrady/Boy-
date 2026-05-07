@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram Bot — Bakong KHQR Payments
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/bot
+EnvironmentFile=/root/bot/.env
+ExecStart=/root/bot/venv/bin/python3 boy.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telegram-bot
+
+[Install]
+WantedBy=multi-user.target

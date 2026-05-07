@@ -51,3 +51,11 @@ Thumbs.db
 # Pyrogram session files (never commit these)
 *.session
 *.session-journal
+
+# Environment secrets (never commit)
+.env
+
+# Python virtualenv
+venv/
+__pycache__/
+*.pyc
