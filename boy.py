@@ -117,11 +117,11 @@ def is_admin(uid) -> bool:
 
 # ── 4. Blocking HTTP session (DB + Bakong, run in thread pool) ────────────────
 _retry = Retry(
-    total=3, backoff_factor=0.5,
+    total=3, backoff_factor=0.2,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["GET", "POST"], raise_on_status=False,
 )
-_adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20)
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=20, pool_maxsize=40)
 http = requests.Session()
 http.headers.update({"Connection": "keep-alive", "Accept-Encoding": "gzip, deflate"})
 http.mount("https://", _adapter)
@@ -243,7 +243,7 @@ def _neon_query(query: str, params=None) -> dict:
     body = {"query": query}
     if params:
         body["params"] = [str(p) if p is not None else None for p in params]
-    resp = http.post(_neon_api_url, headers=_neon_headers, json=body, timeout=15)
+    resp = http.post(_neon_api_url, headers=_neon_headers, json=body, timeout=8)
     resp.raise_for_status()
     return resp.json()
 
@@ -1365,8 +1365,7 @@ async def show_account_selection(chat_id):
             if len(accs) > 0
         ]
     if not available:
-        await send_msg(chat_id, "_សូមអភ័យទោស អស់ពីស្តុក 🪤_",
-                       parse_mode=ParseMode.MARKDOWN)
+        await send_msg(chat_id, "<i>សូមអភ័យទោស អស់ពីស្តុក 🪤</i>")
         return
     rows = []
     for at, count, price in available:
@@ -1472,13 +1471,10 @@ async def _start_payment_for_session(chat_id, user_id, session, callback_query=N
     img_bytes, md5_or_err, qr_string = await run_sync(_generate_payment_qr, session["total_price"])
     if not img_bytes:
         if is_admin(user_id):
-            await send_msg(chat_id, f"❌ *QR បរាជ័យ (Admin Debug):*\n`{md5_or_err}`",
-                           parse_mode=ParseMode.MARKDOWN)
+            await send_msg(chat_id, f"❌ <b>QR បរាជ័យ (Admin Debug):</b>\n<code>{html.escape(str(md5_or_err))}</code>")
         else:
-            await send_msg(chat_id, "❌ *មានបញ្ហាក្នុងការបង្កើត QR Code*\n\nសូមព្យាយាមម្តងទៀត។",
-                           parse_mode=ParseMode.MARKDOWN)
-            await send_msg(ADMIN_ID, f"⚠️ *QR Error (user {user_id}):*\n`{md5_or_err}`",
-                           parse_mode=ParseMode.MARKDOWN)
+            await send_msg(chat_id, "❌ <b>មានបញ្ហាក្នុងការបង្កើត QR Code</b>\n\nសូមព្យាយាមម្តងទៀត។")
+            await send_msg(ADMIN_ID, f"⚠️ <b>QR Error (user {user_id}):</b>\n<code>{html.escape(str(md5_or_err))}</code>")
         await _release_reserved_accounts(session)
         async with _data_lock:
             user_sessions.pop(user_id, None)
@@ -1599,8 +1595,7 @@ async def deliver_accounts(chat_id, user_id, session, payment_data=None, user_na
                 user_sessions.pop(user_id, None)
 
     if delivered is None:
-        await send_msg(chat_id, f"❌ *មានបញ្ហា!*\n\nគ្មាន គូប៉ុង ប្រភេទ {account_type} ក្នុងស្តុក។",
-                       parse_mode=ParseMode.MARKDOWN)
+        await send_msg(chat_id, f"❌ <b>មានបញ្ហា!</b>\n\nគ្មាន គូប៉ុង ប្រភេទ {html.escape(str(account_type))} ក្នុងស្តុក។")
         return
 
     await run_sync(_save_data)
@@ -2021,12 +2016,12 @@ async def _clone_message_handler(update: Update, context: ContextTypes.DEFAULT_T
                         sess["state"] = "waiting_for_account_type"
                     asyncio.create_task(run_sync(_save_sessions))
                     await send_msg(chat_id,
-                                   f"*បានបញ្ចូល គូប៉ុង ចំនួន {len(accs)}\n\nសូមបញ្ចូលប្រភេទ គូប៉ុង៖*",
-                                   parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                                   f"<b>បានបញ្ចូល គូប៉ុង ចំនួន {len(accs)}\n\nសូមបញ្ចូលប្រភេទ គូប៉ុង៖</b>",
+                                   reply_markup=ADD_ACCOUNT_KB)
                 else:
                     await send_msg(chat_id,
-                                   "*មិនរកឃើញអ៊ីមែលត្រឹមត្រូវ!*",
-                                   parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                                   "<b>មិនរកឃើញអ៊ីមែលត្រឹមត្រូវ!</b>",
+                                   reply_markup=ADD_ACCOUNT_KB)
                 return
 
             if state == "waiting_for_account_type":
@@ -2035,8 +2030,8 @@ async def _clone_message_handler(update: Update, context: ContextTypes.DEFAULT_T
                     sess["state"] = "waiting_for_price"
                 asyncio.create_task(run_sync(_save_sessions))
                 await send_msg(chat_id,
-                               f"*សូមដាក់តម្លៃក្នុងប្រភេទ គូប៉ុង {text}*",
-                               parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                               f"<b>សូមដាក់តម្លៃក្នុងប្រភេទ គូប៉ុង {html.escape(str(text))}</b>",
+                               reply_markup=ADD_ACCOUNT_KB)
                 return
 
             if state == "waiting_for_price":
@@ -2056,9 +2051,8 @@ async def _clone_message_handler(update: Update, context: ContextTypes.DEFAULT_T
                     asyncio.create_task(run_sync(_save_sessions))
                     await send_msg(
                         chat_id,
-                        f"*✅ បានបញ្ចូល គូប៉ុង ដោយជោគជ័យ*\n\n"
-                        f"```\n🔹 ចំនួន: {len(accs_to_add)}\n🔹 ប្រភេទ: {account_type}\n🔹 តម្លៃ: {price}$\n```",
-                        parse_mode=ParseMode.MARKDOWN)
+                        f"<b>✅ បានបញ្ចូល គូប៉ុង ដោយជោគជ័យ</b>\n\n"
+                        f"<code>🔹 ចំនួន: {len(accs_to_add)}\n🔹 ប្រភេទ: {html.escape(str(account_type))}\n🔹 តម្លៃ: {price}$</code>")
                 except ValueError:
                     await send_msg(chat_id, "តម្លៃមិនត្រឹមត្រូវ។ សូមបញ្ចូលតម្លៃជាលេខ (ឧ: 5.99)")
                 return
@@ -2175,9 +2169,9 @@ async def _dispatch_admin_button(bot_instance, user_id, chat_id, btn):
             asyncio.create_task(run_sync(_save_sessions))
             await send_msg(
                 chat_id,
-                "*បញ្ចូល គូប៉ុង សម្រាប់លក់ (អ៊ីមែលម្តងមួយបន្ទាត់)៖*\n\n"
-                "```\nl1jebywyzos2@10mail.info\nabc123@gmail.com\n```",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                "<b>បញ្ចូល គូប៉ុង សម្រាប់លក់ (អ៊ីមែលម្តងមួយបន្ទាត់)៖</b>\n\n"
+                "<code>l1jebywyzos2@10mail.info\nabc123@gmail.com</code>",
+                reply_markup=ADD_ACCOUNT_KB)
         elif btn == BTN_DELETE_TYPE:
             await _show_delete_type_menu_inline(chat_id, user_id)
         elif btn == BTN_STOCK:
@@ -2892,27 +2886,27 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 if new_accounts:
                     warnings = []
                     if intra_dupes:
-                        warnings.append(f"⚠️ *អ៊ីមែលដដែល (រំលង)៖*\n```\n{chr(10).join(intra_dupes)}\n```")
+                        warnings.append(f"⚠️ <b>អ៊ីមែលដដែល (រំលង)៖</b>\n<code>{chr(10).join(intra_dupes)}</code>")
                     if stock_dupes:
-                        warnings.append(f"⚠️ *អ៊ីមែលមានស្រាប់ (រំលង)៖*\n```\n{chr(10).join(stock_dupes)}\n```")
+                        warnings.append(f"⚠️ <b>អ៊ីមែលមានស្រាប់ (រំលង)៖</b>\n<code>{chr(10).join(stock_dupes)}</code>")
                     if warnings:
-                        await send_msg(chat_id, "\n\n".join(warnings), parse_mode=ParseMode.MARKDOWN)
+                        await send_msg(chat_id, "\n\n".join(warnings))
                     async with _data_lock:
                         sess["accounts"] = new_accounts
                         sess["state"]    = "waiting_for_account_type"
                     asyncio.create_task(run_sync(_save_sessions))
                     await send_msg(chat_id,
-                                   f"*បានបញ្ចូល គូប៉ុង ចំនួន {len(new_accounts)}\n\nសូមបញ្ចូលប្រភេទ គូប៉ុង៖*",
-                                   parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                                   f"<b>បានបញ្ចូល គូប៉ុង ចំនួន {len(new_accounts)}\n\nសូមបញ្ចូលប្រភេទ គូប៉ុង៖</b>",
+                                   reply_markup=ADD_ACCOUNT_KB)
                 elif accounts:
                     all_d = intra_dupes + stock_dupes
                     await send_msg(chat_id,
-                                   f"❌ *មិនអាចបញ្ចូលបាន!*\n\nអ៊ីមែលទាំងអស់ស្ទួន:\n```\n{chr(10).join(all_d)}\n```",
-                                   parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                                   f"❌ <b>មិនអាចបញ្ចូលបាន!</b>\n\nអ៊ីមែលទាំងអស់ស្ទួន:\n<code>{chr(10).join(all_d)}</code>",
+                                   reply_markup=ADD_ACCOUNT_KB)
                 else:
                     await send_msg(chat_id,
-                                   "*មិនរកឃើញអ៊ីមែលត្រឹមត្រូវ! ទម្រង់:*\n\n```\nl1jebywyzos2@10mail.info\n```",
-                                   parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                                   "<b>មិនរកឃើញអ៊ីមែលត្រឹមត្រូវ! ទម្រង់:</b>\n\n<code>l1jebywyzos2@10mail.info</code>",
+                                   reply_markup=ADD_ACCOUNT_KB)
                 return
 
             if state == "waiting_for_account_type":
@@ -2925,13 +2919,13 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 if existing_price is not None:
                     await send_msg(
                         chat_id,
-                        f"*ប្រភេទ `{account_type_input}` មានស្រាប់ ដែលមានតម្លៃ {existing_price}$\n\n"
-                        f"តម្លៃត្រូវតែដូចគ្នា ({existing_price}$) ដើម្បីបន្ថែម គូប៉ុង:*",
-                        parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                        f"<b>ប្រភេទ <code>{html.escape(str(account_type_input))}</code> មានស្រាប់ ដែលមានតម្លៃ {existing_price}$\n\n"
+                        f"តម្លៃត្រូវតែដូចគ្នា ({existing_price}$) ដើម្បីបន្ថែម គូប៉ុង:</b>",
+                        reply_markup=ADD_ACCOUNT_KB)
                 else:
                     await send_msg(chat_id,
-                                   f"*សូមដាក់តម្លៃក្នុងប្រភេទ គូប៉ុង {account_type_input}*",
-                                   parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                                   f"<b>សូមដាក់តម្លៃក្នុងប្រភេទ គូប៉ុង {html.escape(str(account_type_input))}</b>",
+                                   reply_markup=ADD_ACCOUNT_KB)
                 return
 
             if state == "waiting_for_price":
@@ -2949,9 +2943,8 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     if existing_price is not None and round(existing_price, 4) != round(price, 4):
                         await send_msg(
                             chat_id,
-                            f"❌ *មិនអាចបញ្ចូលបាន!*\n\nប្រភេទ `{account_type}` មានតម្លៃ *{existing_price}$* ស្រាប់។\n"
-                            f"តម្លៃ *{price}$* មិនដូចគ្នា។ សូមប្រើ *{existing_price}$*",
-                            parse_mode=ParseMode.MARKDOWN)
+                            f"❌ <b>មិនអាចបញ្ចូលបាន!</b>\n\nប្រភេទ <code>{html.escape(str(account_type))}</code> មានតម្លៃ <b>{existing_price}$</b> ស្រាប់។\n"
+                            f"តម្លៃ <b>{price}$</b> មិនដូចគ្នា។ សូមប្រើ <b>{existing_price}$</b>")
                         return
                     seen, deduped = set(), []
                     for a in accs_to_add:
@@ -2963,13 +2956,11 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     new_accounts = [a for a in deduped if a.get("email", "").lower() not in all_existing]
                     if dup_emails and not new_accounts:
                         await send_msg(chat_id,
-                                       f"❌ *មិនអាចបញ្ចូលបាន!*\n\nEmail ទាំងអស់មានស្រាប់:\n```\n{chr(10).join(dup_emails)}\n```",
-                                       parse_mode=ParseMode.MARKDOWN)
+                                       f"❌ <b>មិនអាចបញ្ចូលបាន!</b>\n\nEmail ទាំងអស់មានស្រាប់:\n<code>{chr(10).join(dup_emails)}</code>")
                         return
                     if dup_emails:
                         await send_msg(chat_id,
-                                       f"⚠️ *Email ខាងក្រោមមានស្រាប់ ហើយត្រូវបានរំលង:*\n```\n{chr(10).join(dup_emails)}\n```",
-                                       parse_mode=ParseMode.MARKDOWN)
+                                       f"⚠️ <b>Email ខាងក្រោមមានស្រាប់ ហើយត្រូវបានរំលង:</b>\n<code>{chr(10).join(dup_emails)}</code>")
                     async with _data_lock:
                         accounts_data["accounts"].extend(new_accounts)
                         if account_type in accounts_data["account_types"]:
@@ -2982,9 +2973,8 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     asyncio.create_task(run_sync(_save_sessions))
                     await send_msg(
                         chat_id,
-                        f"*✅ បានបញ្ចូល គូប៉ុង ដោយជោគជ័យ*\n\n"
-                        f"```\n🔹 ចំនួន: {len(new_accounts)}\n🔹 ប្រភេទ: {account_type}\n🔹 តម្លៃ: {price}$\n```",
-                        parse_mode=ParseMode.MARKDOWN)
+                        f"<b>✅ បានបញ្ចូល គូប៉ុង ដោយជោគជ័យ</b>\n\n"
+                        f"<code>🔹 ចំនួន: {len(new_accounts)}\n🔹 ប្រភេទ: {html.escape(str(account_type))}\n🔹 តម្លៃ: {price}$</code>")
                     logger.info(f"Admin {uid} added {len(new_accounts)} accounts of type {account_type} @ ${price}")
                 except ValueError:
                     await send_msg(chat_id, "តម្លៃមិនត្រឹមត្រូវ។ សូមបញ្ចូលតម្លៃជាលេខ (ឧ: 5.99)")
@@ -3537,11 +3527,12 @@ async def _run():
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .read_timeout(20)
-        .write_timeout(20)
-        .connect_timeout(15)
-        .pool_timeout(15)
+        .read_timeout(10)
+        .write_timeout(10)
+        .connect_timeout(8)
+        .pool_timeout(8)
         .get_updates_read_timeout(30)
+        .connection_pool_size(16)
         .concurrent_updates(True)
         .build()
     )
@@ -3556,7 +3547,8 @@ async def _run():
         await _on_startup()
         await application.updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True)
+            drop_pending_updates=True,
+            poll_interval=0.0)
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
