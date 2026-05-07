@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Telegram Bot — Bakong KHQR Payments
-Architecture: Pyrogram (MTProto) | Full asyncio | Priority handlers | Memory cache | Pre-handler filters
+Architecture: python-telegram-bot (Bot API) | Full asyncio | Priority handlers | Memory cache | Pre-handler filters
 """
 
 # ── 1. Imports ───────────────────────────────────────────────────────────────
@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -31,16 +32,18 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bakong_khqr import KHQR
 
-from pyrogram import Client, filters, idle
-from pyrogram.enums import ParseMode
-from pyrogram.types import (
+from telegram import (
+    Update, Bot,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
 )
-from pyrogram.errors import (
-    MessageDeleteForbidden, MessageNotModified, FloodWait,
-    UserIsBlocked, InputUserDeactivated, PeerIdInvalid, RPCError,
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application, ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters,
 )
+from telegram.ext import ApplicationHandlerStop
+from telegram.error import BadRequest, Forbidden, RetryAfter, NetworkError, TimedOut
 
 # ── 2. Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -49,17 +52,17 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
-logging.getLogger("pyrogram").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 # ── 2b. Environment Validation ────────────────────────────────────────────────
 _REQUIRED_ENV_VARS = {
     "TELEGRAM_BOT_TOKEN": "Bot token from @BotFather on Telegram",
-    "TELEGRAM_API_ID":    "API ID from https://my.telegram.org",
-    "TELEGRAM_API_HASH":  "API Hash from https://my.telegram.org",
     "BAKONG_TOKEN":       "Bakong KHQR API token",
     "NEON_DATABASE_URL":  "Neon Postgres connection string (postgresql://...)",
     "DROPMAIL_API_TOKEN": "Dropmail API token from https://dropmail.me",
 }
+
 
 def _validate_env() -> None:
     missing = []
@@ -77,23 +80,17 @@ def _validate_env() -> None:
             logger.error(f"       └─ {description}")
         logger.error("=" * 60)
         logger.error("Set these variables in your environment (e.g. .env file")
-        logger.error("or VPS environment) and restart the bot.")
+        logger.error("or Replit Secrets) and restart the bot.")
         logger.error("=" * 60)
         sys.exit(1)
 
-    api_id_raw = os.environ.get("TELEGRAM_API_ID", "").strip()
-    if not api_id_raw.isdigit():
-        logger.error("STARTUP FAILED — TELEGRAM_API_ID must be a numeric value.")
-        sys.exit(1)
-
     logger.info("All required environment variables are present. ✓")
+
 
 _validate_env()
 
 # ── 3. Config ────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-API_ID    = int(os.environ.get("TELEGRAM_API_ID", "0"))
-API_HASH  = os.environ.get("TELEGRAM_API_HASH", "")
 
 ADMIN_ID: int = 5002402843
 EXTRA_ADMIN_IDS: set = set()
@@ -184,20 +181,23 @@ async def run_sync(fn, *args, **kwargs):
     return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
 
 
-# ── 7. Pyrogram Client ────────────────────────────────────────────────────────
-app = Client(
-    name="bot_session",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-)
+# ── 7. Bot Client ─────────────────────────────────────────────────────────────
+application: Application = None   # set in _run()
+bot: Bot = None                    # alias for application.bot
 
-# Context var so send helpers use the right client (main bot vs clone bot)
-_current_client: contextvars.ContextVar = contextvars.ContextVar("_current_client", default=None)
+# Context var so send helpers use the right bot (main bot vs clone bot)
+_current_bot: contextvars.ContextVar = contextvars.ContextVar("_current_bot", default=None)
 
 # Clone-bot globals
 ADMIN_BOT_TOKEN: str = ""
-admin_clone_app = None
+admin_clone_app: Application = None
+admin_clone_task = None
+
+
+def _get_bot() -> Bot:
+    """Return the active Bot for the current coroutine (main or clone)."""
+    return _current_bot.get() or bot
+
 
 # ── 8. Database layer (Neon HTTP API — synchronous, called via run_sync) ──────
 NEON_DATABASE_URL = os.environ.get("NEON_DATABASE_URL", "")
@@ -469,7 +469,6 @@ def _dropmail_delete_address(address_id: str) -> bool:
 def _dropmail_check_token_info() -> dict:
     """Query Dropmail API to verify token validity and get expiry info."""
     try:
-        # Try tokenInfo query first
         q = """query { tokenInfo { expiresAt requestsRemaining } }"""
         data = _dropmail_gql(q)
         info = data.get("data", {}).get("tokenInfo") or {}
@@ -481,7 +480,6 @@ def _dropmail_check_token_info() -> dict:
                 "expires": raw_exp,
                 "remaining": remaining,
             }
-        # Fallback: just test connectivity with __typename
         q2 = """query { __typename }"""
         data2 = _dropmail_gql(q2)
         if data2.get("data"):
@@ -772,25 +770,6 @@ def _filter_out_already_sold(user_id, reserved):
     if dropped:
         logger.info(f"Skipped re-stocking {dropped} already-sold account(s) for user {user_id}")
     return kept
-
-
-def _drain_bot_api_queue():
-    """Consume any updates sitting in Telegram's Bot API HTTP queue.
-    Pyrogram uses MTProto for updates, but stale Bot-API-queued updates can
-    prevent new MTProto pushes from arriving. Draining on startup fixes this."""
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-        # First call: find the highest update_id
-        resp = http.get(url, params={"limit": 100, "timeout": 0}, timeout=15)
-        result = resp.json().get("result", [])
-        if not result:
-            return
-        max_id = max(u["update_id"] for u in result)
-        # Second call: acknowledge them all by advancing offset past the last one
-        http.get(url, params={"offset": max_id + 1, "limit": 1, "timeout": 0}, timeout=15)
-        logger.info(f"Drained {len(result)} stale Bot API update(s) (last id={max_id})")
-    except Exception as e:
-        logger.warning(f"Bot API queue drain failed (non-fatal): {e}")
 
 
 def _cleanup_expired_pending_payments():
@@ -1145,11 +1124,6 @@ def _short_label(text, limit=36):
 
 
 # ── 12. Async send helpers ────────────────────────────────────────────────────
-def _get_client():
-    """Return the active Pyrogram client for the current coroutine (main or clone)."""
-    return _current_client.get() or app
-
-
 def _botapi_send_copy_button(chat_id, text, code: str) -> None:
     """Blocking: send a message with a native copy_text button via Bot API HTTP."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -1171,7 +1145,7 @@ def _botapi_send_copy_button(chat_id, text, code: str) -> None:
 
 async def send_msg(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=None,
                    reply_to_message_id=None, message_effect_id=None):
-    client = _get_client()
+    b = _get_bot()
     try:
         kwargs = dict(chat_id=chat_id, text=text, parse_mode=parse_mode)
         if reply_markup is not None:
@@ -1181,14 +1155,14 @@ async def send_msg(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=None,
         if message_effect_id:
             kwargs["message_effect_id"] = message_effect_id
         try:
-            return await client.send_message(**kwargs)
+            return await b.send_message(**kwargs)
         except TypeError:
             kwargs.pop("message_effect_id", None)
-            return await client.send_message(**kwargs)
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
+            return await b.send_message(**kwargs)
+    except RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
         return await send_msg(chat_id, text, parse_mode, reply_markup, reply_to_message_id, message_effect_id)
-    except (UserIsBlocked, InputUserDeactivated, PeerIdInvalid):
+    except Forbidden:
         pass
     except Exception as e:
         logger.error(f"send_msg({chat_id}) error: {e}")
@@ -1199,8 +1173,8 @@ async def delete_msg(chat_id, message_id):
     if not message_id:
         return
     try:
-        await _get_client().delete_messages(chat_id, message_id)
-    except (MessageDeleteForbidden, RPCError):
+        await _get_bot().delete_message(chat_id, message_id)
+    except (BadRequest, Forbidden):
         pass
     except Exception as e:
         logger.warning(f"delete_msg({chat_id},{message_id}): {e}")
@@ -1220,7 +1194,7 @@ async def delete_msg_later(chat_id, message_id, delay_seconds=120):
 
 
 async def send_photo(chat_id, img_bytes, caption=None, parse_mode=ParseMode.HTML, reply_markup=None):
-    client = _get_client()
+    b = _get_bot()
     try:
         buf = io.BytesIO(img_bytes)
         buf.name = "qr.png"
@@ -1230,9 +1204,9 @@ async def send_photo(chat_id, img_bytes, caption=None, parse_mode=ParseMode.HTML
             kwargs["parse_mode"] = parse_mode
         if reply_markup is not None:
             kwargs["reply_markup"] = reply_markup
-        return await client.send_photo(**kwargs)
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
+        return await b.send_photo(**kwargs)
+    except RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
         return await send_photo(chat_id, img_bytes, caption, parse_mode, reply_markup)
     except Exception as e:
         logger.error(f"send_photo({chat_id}) error: {e}")
@@ -1243,7 +1217,7 @@ async def send_document(chat_id, data_bytes, filename, caption=None):
     try:
         buf = io.BytesIO(data_bytes)
         buf.name = filename
-        return await _get_client().send_document(chat_id, document=buf, caption=caption)
+        return await _get_bot().send_document(chat_id, document=buf, caption=caption)
     except Exception as e:
         logger.error(f"send_document({chat_id}) error: {e}")
     return None
@@ -1251,7 +1225,7 @@ async def send_document(chat_id, data_bytes, filename, caption=None):
 
 async def copy_msg(to_chat_id, from_chat_id, message_id):
     try:
-        return await _get_client().copy_message(to_chat_id, from_chat_id, message_id)
+        return await _get_bot().copy_message(to_chat_id, from_chat_id, message_id)
     except Exception as e:
         logger.error(f"copy_msg error: {e}")
     return None
@@ -1259,7 +1233,7 @@ async def copy_msg(to_chat_id, from_chat_id, message_id):
 
 async def forward_msg(to_chat_id, from_chat_id, message_id):
     try:
-        return await _get_client().forward_messages(to_chat_id, from_chat_id, message_id)
+        return await _get_bot().forward_message(to_chat_id, from_chat_id, message_id)
     except Exception as e:
         logger.error(f"forward_msg error: {e}")
     return None
@@ -1270,8 +1244,8 @@ async def edit_caption(chat_id, message_id, caption, parse_mode=ParseMode.HTML, 
         kwargs = dict(chat_id=chat_id, message_id=message_id, caption=caption, parse_mode=parse_mode)
         if reply_markup:
             kwargs["reply_markup"] = reply_markup
-        return await _get_client().edit_message_caption(**kwargs)
-    except MessageNotModified:
+        return await _get_bot().edit_message_caption(**kwargs)
+    except BadRequest:
         pass
     except Exception as e:
         logger.warning(f"edit_caption error: {e}")
@@ -1472,9 +1446,9 @@ async def _start_payment_for_session(chat_id, user_id, session, callback_query=N
 
     photo_msg = await send_photo(chat_id, img_bytes, reply_markup=CHECK_PAYMENT_INLINE)
     if photo_msg:
-        session["photo_message_id"] = photo_msg.id
-        session["qr_message_id"] = photo_msg.id
-        asyncio.create_task(_schedule_qr_expiry(chat_id, user_id, photo_msg.id, md5_hash, started_at))
+        session["photo_message_id"] = photo_msg.message_id
+        session["qr_message_id"] = photo_msg.message_id
+        asyncio.create_task(_schedule_qr_expiry(chat_id, user_id, photo_msg.message_id, md5_hash, started_at))
 
     asyncio.create_task(run_sync(_save_sessions))
     asyncio.create_task(run_sync(_save_pending_payment, user_id, chat_id, session))
@@ -1832,9 +1806,9 @@ async def _show_maintenance_inline(chat_id):
 
 
 async def _show_clone_bot_inline(chat_id):
-    global admin_clone_app
+    global admin_clone_app, admin_clone_task
     token_display = f"<code>{html.escape(ADMIN_BOT_TOKEN[:10])}…</code>" if ADMIN_BOT_TOKEN else "(មិនទាន់កំណត់)"
-    running = admin_clone_app is not None and admin_clone_app.is_connected
+    running = admin_clone_app is not None and admin_clone_task and not admin_clone_task.done()
     status = "🟢 កំពុងដំណើរការ" if running else "🔴 បិទ"
     await send_msg(
         chat_id,
@@ -1845,252 +1819,249 @@ async def _show_clone_bot_inline(chat_id):
         reply_markup=CLONE_BOT_SUBMENU_KB)
 
 
+async def _clone_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for the admin clone bot — all private messages."""
+    message = update.effective_message
+    user = update.effective_user
+    if not user or not message:
+        return
+
+    uid = user.id
+    if not is_admin(uid):
+        try:
+            await context.bot.send_message(message.chat_id, "⛔ Bot នេះសម្រាប់ admin ប៉ុណ្ណោះ។")
+        except Exception:
+            pass
+        return
+
+    chat_id    = message.chat_id
+    message_id = message.message_id
+    text       = (message.text or "").strip()
+
+    tok = _current_bot.set(context.bot)
+    try:
+        async with get_user_lock(uid):
+            async with _data_lock:
+                sess = user_sessions.get(uid, {})
+            state = str(sess.get("state", ""))
+
+            if text.startswith("/start"):
+                async with _data_lock:
+                    user_sessions.pop(uid, None)
+                asyncio.create_task(run_sync(_save_sessions))
+                await send_admin_settings_menu(chat_id)
+                return
+
+            if text.startswith("/cancel"):
+                async with _data_lock:
+                    user_sessions.pop(uid, None)
+                asyncio.create_task(run_sync(_save_sessions))
+                await send_admin_settings_menu(chat_id)
+                return
+
+            if text == ADMIN_SETTINGS_BTN:
+                if state.startswith("admin_input:"):
+                    async with _data_lock:
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_sessions))
+                await send_admin_settings_menu(chat_id)
+                return
+
+            if state.startswith("admin_input:"):
+                key = state.split(":", 1)[1]
+                if await _handle_admin_settings_input(chat_id, uid, message_id, key, text):
+                    return
+
+            if state == "delete_type_select":
+                labels = sess.get("labels", {}) or {}
+                if text == BTN_BACK_SETTINGS:
+                    async with _data_lock:
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_sessions))
+                    await send_admin_settings_menu(chat_id)
+                    return
+                type_name = labels.get(text)
+                if type_name and type_name in accounts_data.get("account_types", {}):
+                    async with _data_lock:
+                        count = len(accounts_data["account_types"].get(type_name, []))
+                        price = accounts_data.get("prices", {}).get(type_name, 0)
+                        user_sessions[uid] = {"state": "delete_type_confirm", "type_name": type_name}
+                    asyncio.create_task(run_sync(_save_sessions))
+                    await send_msg(
+                        chat_id,
+                        f"⚠️ <b>តើអ្នកពិតជាចង់លុបប្រភេទ គូប៉ុង នេះមែនទេ?</b>\n\n"
+                        f"<blockquote>🔹 ប្រភេទ: {html.escape(type_name)}\n"
+                        f"🔹 ចំនួន: {count}\n🔹 តម្លៃ: ${price}</blockquote>",
+                        reply_markup=ReplyKeyboardMarkup([
+                            [KeyboardButton(BTN_DELETE_CONFIRM)],
+                            [KeyboardButton(BTN_DELETE_CANCEL)],
+                        ], resize_keyboard=True, is_persistent=True))
+                    return
+
+            if state == "delete_type_confirm":
+                type_name = sess.get("type_name")
+                if text == BTN_DELETE_CONFIRM:
+                    async with _data_lock:
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_sessions))
+                    if not type_name or type_name not in accounts_data.get("account_types", {}):
+                        await send_msg(chat_id, "⚠️ <b>ប្រភេទនេះមិនមានទៀតហើយ!</b>",
+                                       reply_markup=ADMIN_SETTINGS_KB)
+                        return
+                    async with _data_lock:
+                        count = len(accounts_data["account_types"].pop(type_name, []))
+                        accounts_data.get("prices", {}).pop(type_name, None)
+                        accounts_data["accounts"] = [
+                            a for a in accounts_data.get("accounts", []) if a.get("type") != type_name]
+                    asyncio.create_task(run_sync(_save_data))
+                    await send_msg(chat_id,
+                                   f"✅ <b>បានលុបប្រភេទ <code>{html.escape(type_name)}</code> ចំនួន {count} records!</b>",
+                                   reply_markup=ADMIN_SETTINGS_KB)
+                    return
+                elif text == BTN_DELETE_CANCEL:
+                    async with _data_lock:
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_sessions))
+                    await send_msg(chat_id, "🚫 <b>បានបោះបង់ការលុប</b>", reply_markup=ADMIN_SETTINGS_KB)
+                    return
+
+            if state == "broadcast_confirm":
+                if text == BTN_BROADCAST_CONFIRM:
+                    bcast_msg_id  = sess.get("broadcast_message_id")
+                    bcast_chat_id = sess.get("broadcast_chat_id") or chat_id
+                    use_copy      = bool(sess.get("broadcast_use_copy"))
+                    async with _data_lock:
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_sessions))
+                    if bcast_msg_id:
+                        await send_msg(chat_id, "📢 កំពុង​ផ្សាយ​សារ ... សូមរង់ចាំ",
+                                       reply_markup=ADMIN_SETTINGS_KB)
+                        asyncio.create_task(_run_broadcast(bcast_chat_id, bcast_msg_id, use_copy))
+                    else:
+                        await send_msg(chat_id, "⚠️ មិន​ឃើញ​សារ​ដែល​ចង់​ផ្សាយ​ទេ",
+                                       reply_markup=ADMIN_SETTINGS_KB)
+                    return
+                elif text == BTN_BROADCAST_CANCEL:
+                    async with _data_lock:
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_sessions))
+                    await send_msg(chat_id, "🚫 <b>បាន​បោះបង់​ការ​ផ្សាយ</b>", reply_markup=ADMIN_SETTINGS_KB)
+                    return
+
+            if state == "email_delete_picker":
+                if text == BTN_BACK_SETTINGS:
+                    async with _data_lock:
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_sessions))
+                    await send_admin_settings_menu(chat_id)
+                    return
+                entries = await run_sync(_email_history_entries, uid)
+                emails = {e['email_address'] for e in entries}
+                if text in emails:
+                    await _email_handle_delete_confirm(chat_id, uid, text)
+                    return
+
+            if state == "waiting_for_accounts":
+                email_pat = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+                accs = []
+                for line in text.strip().split("\n"):
+                    em = line.strip()
+                    if em and email_pat.match(em):
+                        accs.append({"email": em})
+                if accs:
+                    async with _data_lock:
+                        sess["accounts"] = accs
+                        sess["state"] = "waiting_for_account_type"
+                    asyncio.create_task(run_sync(_save_sessions))
+                    await send_msg(chat_id,
+                                   f"*បានបញ្ចូល គូប៉ុង ចំនួន {len(accs)}\n\nសូមបញ្ចូលប្រភេទ គូប៉ុង៖*",
+                                   parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                else:
+                    await send_msg(chat_id,
+                                   "*មិនរកឃើញអ៊ីមែលត្រឹមត្រូវ!*",
+                                   parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                return
+
+            if state == "waiting_for_account_type":
+                async with _data_lock:
+                    sess["account_type"] = text
+                    sess["state"] = "waiting_for_price"
+                asyncio.create_task(run_sync(_save_sessions))
+                await send_msg(chat_id,
+                               f"*សូមដាក់តម្លៃក្នុងប្រភេទ គូប៉ុង {text}*",
+                               parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                return
+
+            if state == "waiting_for_price":
+                try:
+                    price = float(text.strip().replace("$", ""))
+                    account_type = sess.get("account_type", "")
+                    accs_to_add  = sess.get("accounts", [])
+                    async with _data_lock:
+                        accounts_data["accounts"].extend(accs_to_add)
+                        if account_type in accounts_data["account_types"]:
+                            accounts_data["account_types"][account_type].extend(accs_to_add)
+                        else:
+                            accounts_data["account_types"][account_type] = list(accs_to_add)
+                        accounts_data["prices"][account_type] = price
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_data))
+                    asyncio.create_task(run_sync(_save_sessions))
+                    await send_msg(
+                        chat_id,
+                        f"*✅ បានបញ្ចូល គូប៉ុង ដោយជោគជ័យ*\n\n"
+                        f"```\n🔹 ចំនួន: {len(accs_to_add)}\n🔹 ប្រភេទ: {account_type}\n🔹 តម្លៃ: {price}$\n```",
+                        parse_mode=ParseMode.MARKDOWN)
+                except ValueError:
+                    await send_msg(chat_id, "តម្លៃមិនត្រឹមត្រូវ។ សូមបញ្ចូលតម្លៃជាលេខ (ឧ: 5.99)")
+                return
+
+            if text in ADMIN_BUTTON_LABELS:
+                await _dispatch_admin_button(context.bot, uid, chat_id, text)
+                return
+
+            await send_admin_settings_menu(chat_id)
+    finally:
+        _current_bot.reset(tok)
+
+
 async def _start_admin_clone_bot(token: str) -> str:
     """Start the admin-only clone bot. Returns status message."""
-    global admin_clone_app, ADMIN_BOT_TOKEN
-    from pyrogram.handlers import MessageHandler as _MH
+    global admin_clone_app, admin_clone_task, ADMIN_BOT_TOKEN
 
-    if admin_clone_app is not None:
+    # Stop existing clone bot
+    if admin_clone_task and not admin_clone_task.done():
+        admin_clone_task.cancel()
         try:
+            await admin_clone_task
+        except Exception:
+            pass
+        admin_clone_task = None
+
+    if admin_clone_app:
+        try:
+            await admin_clone_app.updater.stop()
             await admin_clone_app.stop()
+            await admin_clone_app.shutdown()
         except Exception:
             pass
         admin_clone_app = None
 
     try:
-        clone = Client(
-            name="admin_clone_session",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            bot_token=token,
-        )
+        clone = ApplicationBuilder().token(token).build()
+        clone.add_handler(MessageHandler(filters.ChatType.PRIVATE, _clone_message_handler))
 
-        async def _clone_guard(client, message):
-            uid = message.from_user.id if message.from_user else None
-            if not is_admin(uid):
-                try:
-                    await client.send_message(
-                        message.chat.id,
-                        "⛔ Bot នេះសម្រាប់ admin ប៉ុណ្ណោះ។")
-                except Exception:
-                    pass
-                message.stop_propagation()
-                return
-
-            chat_id    = message.chat.id
-            message_id = message.id
-            text       = (message.text or "").strip()
-
-            tok = _current_client.set(client)
-            try:
-                async with get_user_lock(uid):
-                    async with _data_lock:
-                        sess = user_sessions.get(uid, {})
-                    state = str(sess.get("state", ""))
-
-                    if text.startswith("/start"):
-                        async with _data_lock:
-                            user_sessions.pop(uid, None)
-                        asyncio.create_task(run_sync(_save_sessions))
-                        await send_admin_settings_menu(chat_id)
-                        message.stop_propagation()
-                        return
-
-                    if text.startswith("/cancel"):
-                        async with _data_lock:
-                            user_sessions.pop(uid, None)
-                        asyncio.create_task(run_sync(_save_sessions))
-                        await send_admin_settings_menu(chat_id)
-                        message.stop_propagation()
-                        return
-
-                    if text == ADMIN_SETTINGS_BTN:
-                        if state.startswith("admin_input:"):
-                            async with _data_lock:
-                                user_sessions.pop(uid, None)
-                            asyncio.create_task(run_sync(_save_sessions))
-                        await send_admin_settings_menu(chat_id)
-                        message.stop_propagation()
-                        return
-
-                    if state.startswith("admin_input:"):
-                        key = state.split(":", 1)[1]
-                        if await _handle_admin_settings_input(chat_id, uid, message_id, key, text):
-                            message.stop_propagation()
-                            return
-
-                    if state == "delete_type_select":
-                        labels = sess.get("labels", {}) or {}
-                        if text == BTN_BACK_SETTINGS:
-                            async with _data_lock:
-                                user_sessions.pop(uid, None)
-                            asyncio.create_task(run_sync(_save_sessions))
-                            await send_admin_settings_menu(chat_id)
-                            message.stop_propagation()
-                            return
-                        type_name = labels.get(text)
-                        if type_name and type_name in accounts_data.get("account_types", {}):
-                            async with _data_lock:
-                                count = len(accounts_data["account_types"].get(type_name, []))
-                                price = accounts_data.get("prices", {}).get(type_name, 0)
-                                user_sessions[uid] = {"state": "delete_type_confirm", "type_name": type_name}
-                            asyncio.create_task(run_sync(_save_sessions))
-                            await send_msg(
-                                chat_id,
-                                f"⚠️ <b>តើអ្នកពិតជាចង់លុបប្រភេទ គូប៉ុង នេះមែនទេ?</b>\n\n"
-                                f"<blockquote>🔹 ប្រភេទ: {html.escape(type_name)}\n"
-                                f"🔹 ចំនួន: {count}\n🔹 តម្លៃ: ${price}</blockquote>",
-                                reply_markup=ReplyKeyboardMarkup([
-                                    [KeyboardButton(BTN_DELETE_CONFIRM)],
-                                    [KeyboardButton(BTN_DELETE_CANCEL)],
-                                ], resize_keyboard=True, is_persistent=True))
-                            message.stop_propagation()
-                            return
-
-                    if state == "delete_type_confirm":
-                        type_name = sess.get("type_name")
-                        if text == BTN_DELETE_CONFIRM:
-                            async with _data_lock:
-                                user_sessions.pop(uid, None)
-                            asyncio.create_task(run_sync(_save_sessions))
-                            if not type_name or type_name not in accounts_data.get("account_types", {}):
-                                await send_msg(chat_id, "⚠️ <b>ប្រភេទនេះមិនមានទៀតហើយ!</b>",
-                                               reply_markup=ADMIN_SETTINGS_KB)
-                                message.stop_propagation()
-                                return
-                            async with _data_lock:
-                                count = len(accounts_data["account_types"].pop(type_name, []))
-                                accounts_data.get("prices", {}).pop(type_name, None)
-                                accounts_data["accounts"] = [
-                                    a for a in accounts_data.get("accounts", []) if a.get("type") != type_name]
-                            asyncio.create_task(run_sync(_save_data))
-                            await send_msg(chat_id,
-                                           f"✅ <b>បានលុបប្រភេទ <code>{html.escape(type_name)}</code> ចំនួន {count} records!</b>",
-                                           reply_markup=ADMIN_SETTINGS_KB)
-                            message.stop_propagation()
-                            return
-                        elif text == BTN_DELETE_CANCEL:
-                            async with _data_lock:
-                                user_sessions.pop(uid, None)
-                            asyncio.create_task(run_sync(_save_sessions))
-                            await send_msg(chat_id, "🚫 <b>បានបោះបង់ការលុប</b>", reply_markup=ADMIN_SETTINGS_KB)
-                            message.stop_propagation()
-                            return
-
-                    if state == "broadcast_confirm":
-                        if text == BTN_BROADCAST_CONFIRM:
-                            bcast_msg_id  = sess.get("broadcast_message_id")
-                            bcast_chat_id = sess.get("broadcast_chat_id") or chat_id
-                            use_copy      = bool(sess.get("broadcast_use_copy"))
-                            async with _data_lock:
-                                user_sessions.pop(uid, None)
-                            asyncio.create_task(run_sync(_save_sessions))
-                            if bcast_msg_id:
-                                await send_msg(chat_id, "📢 កំពុង​ផ្សាយ​សារ ... សូមរង់ចាំ",
-                                               reply_markup=ADMIN_SETTINGS_KB)
-                                asyncio.create_task(_run_broadcast(bcast_chat_id, bcast_msg_id, use_copy))
-                            else:
-                                await send_msg(chat_id, "⚠️ មិន​ឃើញ​សារ​ដែល​ចង់​ផ្សាយ​ទេ",
-                                               reply_markup=ADMIN_SETTINGS_KB)
-                            message.stop_propagation()
-                            return
-                        elif text == BTN_BROADCAST_CANCEL:
-                            async with _data_lock:
-                                user_sessions.pop(uid, None)
-                            asyncio.create_task(run_sync(_save_sessions))
-                            await send_msg(chat_id, "🚫 <b>បាន​បោះបង់​ការ​ផ្សាយ</b>", reply_markup=ADMIN_SETTINGS_KB)
-                            message.stop_propagation()
-                            return
-
-                    if state == "email_delete_picker":
-                        if text == BTN_BACK_SETTINGS:
-                            async with _data_lock:
-                                user_sessions.pop(uid, None)
-                            asyncio.create_task(run_sync(_save_sessions))
-                            await send_admin_settings_menu(chat_id)
-                            message.stop_propagation()
-                            return
-                        entries = await run_sync(_email_history_entries, uid)
-                        emails = {e['email_address'] for e in entries}
-                        if text in emails:
-                            await _email_handle_delete_confirm(chat_id, uid, text)
-                            message.stop_propagation()
-                            return
-
-                    if state == "waiting_for_accounts":
-                        email_pat = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-                        accs = []
-                        for line in text.strip().split("\n"):
-                            em = line.strip()
-                            if em and email_pat.match(em):
-                                accs.append({"email": em})
-                        if accs:
-                            async with _data_lock:
-                                sess["accounts"] = accs
-                                sess["state"] = "waiting_for_account_type"
-                            asyncio.create_task(run_sync(_save_sessions))
-                            await send_msg(chat_id,
-                                           f"*បានបញ្ចូល គូប៉ុង ចំនួន {len(accs)}\n\nសូមបញ្ចូលប្រភេទ គូប៉ុង៖*",
-                                           parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
-                        else:
-                            await send_msg(chat_id,
-                                           "*មិនរកឃើញអ៊ីមែលត្រឹមត្រូវ!*",
-                                           parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
-                        message.stop_propagation()
-                        return
-
-                    if state == "waiting_for_account_type":
-                        async with _data_lock:
-                            sess["account_type"] = text
-                            sess["state"] = "waiting_for_price"
-                        asyncio.create_task(run_sync(_save_sessions))
-                        await send_msg(chat_id,
-                                       f"*សូមដាក់តម្លៃក្នុងប្រភេទ គូប៉ុង {text}*",
-                                       parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
-                        message.stop_propagation()
-                        return
-
-                    if state == "waiting_for_price":
-                        try:
-                            price = float(text.strip().replace("$", ""))
-                            account_type = sess.get("account_type", "")
-                            accs_to_add  = sess.get("accounts", [])
-                            async with _data_lock:
-                                accounts_data["accounts"].extend(accs_to_add)
-                                if account_type in accounts_data["account_types"]:
-                                    accounts_data["account_types"][account_type].extend(accs_to_add)
-                                else:
-                                    accounts_data["account_types"][account_type] = list(accs_to_add)
-                                accounts_data["prices"][account_type] = price
-                                user_sessions.pop(uid, None)
-                            asyncio.create_task(run_sync(_save_data))
-                            asyncio.create_task(run_sync(_save_sessions))
-                            await send_msg(
-                                chat_id,
-                                f"*✅ បានបញ្ចូល គូប៉ុង ដោយជោគជ័យ*\n\n"
-                                f"```\n🔹 ចំនួន: {len(accs_to_add)}\n🔹 ប្រភេទ: {account_type}\n🔹 តម្លៃ: {price}$\n```",
-                                parse_mode=ParseMode.MARKDOWN)
-                        except ValueError:
-                            await send_msg(chat_id, "តម្លៃមិនត្រឹមត្រូវ។ សូមបញ្ចូលតម្លៃជាលេខ (ឧ: 5.99)")
-                        message.stop_propagation()
-                        return
-
-                    if text in ADMIN_BUTTON_LABELS:
-                        await _dispatch_admin_button(client, message, uid, chat_id, text)
-                        message.stop_propagation()
-                        return
-
-                    await send_admin_settings_menu(chat_id)
-                    message.stop_propagation()
-            finally:
-                _current_client.reset(tok)
-
-        clone.add_handler(_MH(_clone_guard, filters.private), group=0)
+        await clone.initialize()
         await clone.start()
+
         admin_clone_app = clone
         ADMIN_BOT_TOKEN = token
         await run_sync(_set_setting, "ADMIN_BOT_TOKEN", token)
-        me = await clone.get_me()
+
+        # Start manual polling loop
+        admin_clone_task = asyncio.create_task(_clone_bot_poll_loop(clone))
+
+        me = await clone.bot.get_me()
         logger.info(f"Admin clone bot started: @{me.username}")
         return f"✅ <b>Clone Bot Admin ចាប់ផ្ដើមដំណើរការ!</b>\n\n🤖 @{me.username}"
     except Exception as e:
@@ -2099,24 +2070,52 @@ async def _start_admin_clone_bot(token: str) -> str:
         return f"❌ <b>Clone Bot ចាប់ផ្ដើមមិនបាន:</b>\n<code>{html.escape(str(e))}</code>"
 
 
+async def _clone_bot_poll_loop(clone_app: Application):
+    """Manual polling loop for the admin clone bot."""
+    offset = 0
+    while True:
+        try:
+            updates = await clone_app.bot.get_updates(
+                offset=offset, timeout=5,
+                allowed_updates=["message", "callback_query"])
+            for update in updates:
+                offset = update.update_id + 1
+                asyncio.create_task(clone_app.process_update(update))
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Clone bot poll error: {e}")
+            await asyncio.sleep(5)
+
+
 async def _stop_admin_clone_bot() -> str:
     """Stop the admin clone bot."""
-    global admin_clone_app, ADMIN_BOT_TOKEN
-    if admin_clone_app is None:
+    global admin_clone_app, admin_clone_task, ADMIN_BOT_TOKEN
+    if admin_clone_app is None and (not admin_clone_task or admin_clone_task.done()):
         return "ℹ️ Clone Bot មិនទាន់ដំណើរការ។"
-    try:
-        await admin_clone_app.stop()
-    except Exception as e:
-        logger.warning(f"Clone bot stop error (ignored): {e}")
-    admin_clone_app = None
+    if admin_clone_task and not admin_clone_task.done():
+        admin_clone_task.cancel()
+        try:
+            await admin_clone_task
+        except Exception:
+            pass
+        admin_clone_task = None
+    if admin_clone_app:
+        try:
+            await admin_clone_app.updater.stop()
+            await admin_clone_app.stop()
+            await admin_clone_app.shutdown()
+        except Exception as e:
+            logger.warning(f"Clone bot stop error (ignored): {e}")
+        admin_clone_app = None
     logger.info("Admin clone bot stopped.")
     return "⛔ <b>Clone Bot Admin បានបិទ។</b>"
 
 
-async def _dispatch_admin_button(client, message, user_id, chat_id, btn):
+async def _dispatch_admin_button(bot_instance, user_id, chat_id, btn):
     """Shared button dispatch used by both main and clone admin bots."""
     global MAINTENANCE_MODE, CHANNEL_ID
-    tok = _current_client.set(client)
+    tok = _current_bot.set(bot_instance)
     try:
         if btn == BTN_BACK_SETTINGS:
             async with _data_lock:
@@ -2226,7 +2225,7 @@ async def _dispatch_admin_button(client, message, user_id, chat_id, btn):
                 msg = await _start_admin_clone_bot(ADMIN_BOT_TOKEN)
                 await send_msg(chat_id, msg, reply_markup=CLONE_BOT_SUBMENU_KB)
     finally:
-        _current_client.reset(tok)
+        _current_bot.reset(tok)
 
 
 async def _handle_admin_settings_input(chat_id, user_id, message_id, key, text):
@@ -2411,7 +2410,7 @@ async def _run_broadcast(admin_chat_id, source_message_id, use_copy=False):
                     sent += 1
                 else:
                     failed += 1
-            except (UserIsBlocked, InputUserDeactivated, PeerIdInvalid):
+            except Forbidden:
                 blocked += 1
             except Exception as e:
                 failed += 1
@@ -2441,8 +2440,8 @@ def _parse_verification_message(text):
 
 
 async def handle_channel_post(message):
-    chat_id    = message.chat.id
-    message_id = message.id
+    chat_id    = message.chat_id
+    message_id = message.message_id
     if not CHANNEL_ID or str(chat_id) != str(CHANNEL_ID):
         return
     text = message.text or message.caption or ""
@@ -2456,12 +2455,12 @@ async def handle_channel_post(message):
         for bid in buyers:
             sent = await send_msg(bid, formatted, reply_markup=False)
             if sent:
-                await delete_msg_later(bid, sent.id, 60)
+                await delete_msg_later(bid, sent.message_id, 60)
                 delivered_to.append(bid)
         if not delivered_to:
             sent = await send_msg(ADMIN_ID, formatted)
             if sent:
-                await delete_msg_later(ADMIN_ID, sent.id, 60)
+                await delete_msg_later(ADMIN_ID, sent.message_id, 60)
         return
     copied = await copy_msg(ADMIN_ID, chat_id, message_id)
     if copied:
@@ -2470,306 +2469,7 @@ async def handle_channel_post(message):
         await send_msg(ADMIN_ID, text)
 
 
-# ── 17. Custom Pyrogram filters ───────────────────────────────────────────────
-def _make_admin_filter():
-    async def func(_, __, message):
-        uid = message.from_user.id if message.from_user else None
-        return bool(uid and is_admin(uid))
-    return filters.create(func, "AdminFilter")
-
-
-def _make_maintenance_block_filter():
-    """Passes (returns True) when maintenance is ON and user is NOT admin."""
-    async def func(_, __, message):
-        if not MAINTENANCE_MODE:
-            return False
-        uid = message.from_user.id if message.from_user else None
-        return not is_admin(uid)
-    return filters.create(func, "MaintenanceBlockFilter")
-
-
-def _make_has_admin_input_session_filter():
-    async def func(_, __, message):
-        uid = message.from_user.id if message.from_user else None
-        if not uid or not is_admin(uid):
-            return False
-        sess = user_sessions.get(uid)
-        return bool(sess and str(sess.get("state", "")).startswith("admin_input:"))
-    return filters.create(func, "HasAdminInputSessionFilter")
-
-
-def _make_has_admin_state_filter(state_name):
-    async def func(_, __, message):
-        uid = message.from_user.id if message.from_user else None
-        if not uid or not is_admin(uid):
-            return False
-        sess = user_sessions.get(uid)
-        return bool(sess and sess.get("state") == state_name)
-    return filters.create(func, f"AdminState_{state_name}")
-
-
-def _make_admin_button_filter():
-    async def func(_, __, message):
-        uid = message.from_user.id if message.from_user else None
-        if not uid or not is_admin(uid):
-            return False
-        return bool(message.text and message.text.strip() in ADMIN_BUTTON_LABELS)
-    return filters.create(func, "AdminButtonFilter")
-
-
-def _make_payment_pending_filter():
-    async def func(_, __, message):
-        uid = message.from_user.id if message.from_user else None
-        if not uid:
-            return False
-        sess = user_sessions.get(uid)
-        return bool(sess and sess.get("state") == "payment_pending")
-    return filters.create(func, "PaymentPendingFilter")
-
-
-admin_filter              = _make_admin_filter()
-maintenance_block_filter  = _make_maintenance_block_filter()
-has_admin_input_filter    = _make_has_admin_input_session_filter()
-admin_button_filter       = _make_admin_button_filter()
-payment_pending_filter    = _make_payment_pending_filter()
-delete_type_select_filter  = _make_has_admin_state_filter("delete_type_select")
-delete_type_confirm_filter = _make_has_admin_state_filter("delete_type_confirm")
-broadcast_confirm_filter   = _make_has_admin_state_filter("broadcast_confirm")
-email_delete_picker_filter = _make_has_admin_state_filter("email_delete_picker")
-
-
-# ── 18. Handlers — Priority via group parameter (lower = higher priority) ─────
-
-# ─── group -10: Channel posts ──────────────────────────────────────────────────
-@app.on_message(filters.channel, group=-10)
-async def on_channel_post(client, message):
-    await handle_channel_post(message)
-    message.stop_propagation()
-
-
-# ─── group -5: Maintenance mode blocker ───────────────────────────────────────
-@app.on_message(filters.private & maintenance_block_filter, group=-5)
-async def on_maintenance(client, message):
-    await send_msg(message.chat.id,
-                   "🔧 <b>Bot កំពុង Update សូមរង់ចាំមួយភ្លែត...</b>")
-    message.stop_propagation()
-
-
-# ─── group 0: /start and /cancel commands ─────────────────────────────────────
-@app.on_message(filters.private & filters.command("start"), group=0)
-async def on_start(client, message):
-    user = message.from_user
-    asyncio.create_task(
-        notify_admin_new_user(user.id, user.first_name, user.last_name, user.username))
-    async with get_user_lock(user.id):
-        if await _has_active_purchase(user.id):
-            await _notify_must_finish_order(message.chat.id)
-            message.stop_propagation()
-            return
-        await _reset_user_session(user.id)
-        logger.info(f"User {user.id} triggered account selection")
-        await show_account_selection(message.chat.id)
-    message.stop_propagation()
-
-
-@app.on_message(filters.private & filters.command("cancel"), group=0)
-async def on_cancel(client, message):
-    user_id  = message.from_user.id
-    chat_id  = message.chat.id
-    async with get_user_lock(user_id):
-        session = user_sessions.get(user_id) or await run_sync(_get_pending_payment, user_id)
-        if not session or session.get("state") not in ("waiting_for_quantity", "payment_pending"):
-            await show_account_selection(chat_id)
-            message.stop_propagation()
-            return
-        for key in ("photo_message_id", "qr_message_id", "dot_message_id"):
-            mid = session.get(key)
-            if mid:
-                asyncio.create_task(delete_msg(chat_id, mid))
-        await _reset_user_session(user_id)
-        await show_account_selection(chat_id)
-    message.stop_propagation()
-
-
-# ─── group 1: Admin ⚙️ button ─────────────────────────────────────────────────
-@app.on_message(
-    filters.private & admin_filter
-    & filters.text & filters.regex(f"^{re.escape(ADMIN_SETTINGS_BTN)}$"),
-    group=1)
-async def on_admin_settings_btn(client, message):
-    user_id = message.from_user.id
-    async with _data_lock:
-        sess = user_sessions.get(user_id, {})
-        if str(sess.get("state", "")).startswith("admin_input:"):
-            user_sessions.pop(user_id, None)
-    asyncio.create_task(run_sync(_save_sessions))
-    await send_admin_settings_menu(message.chat.id)
-    message.stop_propagation()
-
-
-# ─── group 2: Admin pending input (payment, bakong, channel, admin, broadcast) ─
-@app.on_message(filters.private & has_admin_input_filter, group=2)
-async def on_admin_input(client, message):
-    user_id    = message.from_user.id
-    chat_id    = message.chat.id
-    message_id = message.id
-    text       = message.text or ""
-    async with get_user_lock(user_id):
-        async with _data_lock:
-            sess = user_sessions.get(user_id, {})
-        state = str(sess.get("state", ""))
-        if state.startswith("admin_input:"):
-            key = state.split(":", 1)[1]
-            if await _handle_admin_settings_input(chat_id, user_id, message_id, key, text):
-                message.stop_propagation()
-
-
-# ─── group 3: Admin delete_type_select state ──────────────────────────────────
-@app.on_message(filters.private & delete_type_select_filter, group=3)
-async def on_delete_type_select(client, message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    text    = (message.text or "").strip()
-    async with get_user_lock(user_id):
-        async with _data_lock:
-            sess = user_sessions.get(user_id, {})
-        labels = sess.get("labels", {}) or {}
-        if text == BTN_BACK_SETTINGS:
-            async with _data_lock:
-                user_sessions.pop(user_id, None)
-            asyncio.create_task(run_sync(_save_sessions))
-            await send_admin_settings_menu(chat_id)
-            message.stop_propagation()
-            return
-        type_name = labels.get(text)
-        if type_name and type_name in accounts_data.get("account_types", {}):
-            async with _data_lock:
-                count = len(accounts_data["account_types"].get(type_name, []))
-                price = accounts_data.get("prices", {}).get(type_name, 0)
-                user_sessions[user_id] = {"state": "delete_type_confirm", "type_name": type_name}
-            asyncio.create_task(run_sync(_save_sessions))
-            await send_msg(
-                chat_id,
-                f"⚠️ <b>តើអ្នកពិតជាចង់លុបប្រភេទ គូប៉ុង នេះមែនទេ?</b>\n\n"
-                f"<blockquote>🔹 ប្រភេទ: {html.escape(type_name)}\n"
-                f"🔹 ចំនួន: {count}\n🔹 តម្លៃ: ${price}</blockquote>",
-                reply_markup=ReplyKeyboardMarkup([
-                    [KeyboardButton(BTN_DELETE_CONFIRM)],
-                    [KeyboardButton(BTN_DELETE_CANCEL)],
-                ], resize_keyboard=True, is_persistent=True))
-            message.stop_propagation()
-
-
-# ─── group 3: Admin delete_type_confirm state ─────────────────────────────────
-@app.on_message(filters.private & delete_type_confirm_filter, group=3)
-async def on_delete_type_confirm(client, message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    text    = (message.text or "").strip()
-    async with get_user_lock(user_id):
-        async with _data_lock:
-            type_name = user_sessions.get(user_id, {}).get("type_name")
-        if text == BTN_DELETE_CONFIRM:
-            async with _data_lock:
-                user_sessions.pop(user_id, None)
-            asyncio.create_task(run_sync(_save_sessions))
-            if not type_name or type_name not in accounts_data.get("account_types", {}):
-                await send_msg(chat_id, "⚠️ <b>ប្រភេទនេះមិនមានទៀតហើយ!</b>",
-                               reply_markup=ADMIN_SETTINGS_KB)
-                message.stop_propagation()
-                return
-            async with _data_lock:
-                count = len(accounts_data["account_types"].pop(type_name, []))
-                accounts_data.get("prices", {}).pop(type_name, None)
-                accounts_data["accounts"] = [
-                    a for a in accounts_data.get("accounts", []) if a.get("type") != type_name]
-            asyncio.create_task(run_sync(_save_data))
-            await send_msg(chat_id,
-                           f"✅ <b>បានលុបប្រភេទ <code>{html.escape(type_name)}</code> ចំនួន {count} records!</b>",
-                           reply_markup=ADMIN_SETTINGS_KB)
-            logger.info(f"Admin {user_id} deleted type '{type_name}' ({count} records)")
-            message.stop_propagation()
-        elif text == BTN_DELETE_CANCEL:
-            async with _data_lock:
-                user_sessions.pop(user_id, None)
-            asyncio.create_task(run_sync(_save_sessions))
-            await send_msg(chat_id, "🚫 <b>បានបោះបង់ការលុប</b>", reply_markup=ADMIN_SETTINGS_KB)
-            message.stop_propagation()
-
-
-# ─── group 3: Admin broadcast_confirm state ───────────────────────────────────
-@app.on_message(filters.private & broadcast_confirm_filter, group=3)
-async def on_broadcast_confirm(client, message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    text    = (message.text or "").strip()
-    async with get_user_lock(user_id):
-        async with _data_lock:
-            sess = user_sessions.get(user_id, {})
-        if text == BTN_BROADCAST_CONFIRM:
-            bcast_msg_id  = sess.get("broadcast_message_id")
-            bcast_chat_id = sess.get("broadcast_chat_id") or chat_id
-            use_copy      = bool(sess.get("broadcast_use_copy"))
-            async with _data_lock:
-                user_sessions.pop(user_id, None)
-            asyncio.create_task(run_sync(_save_sessions))
-            if not bcast_msg_id:
-                await send_msg(chat_id, "⚠️ មិន​ឃើញ​សារ​ដែល​ចង់​ផ្សាយ​ទេ",
-                               reply_markup=ADMIN_SETTINGS_KB)
-                message.stop_propagation()
-                return
-            await send_msg(chat_id, "📢 កំពុង​ផ្សាយ​សារ ... សូមរង់ចាំ",
-                           reply_markup=ADMIN_SETTINGS_KB)
-            asyncio.create_task(_run_broadcast(bcast_chat_id, bcast_msg_id, use_copy))
-            message.stop_propagation()
-        elif text == BTN_BROADCAST_CANCEL:
-            async with _data_lock:
-                user_sessions.pop(user_id, None)
-            asyncio.create_task(run_sync(_save_sessions))
-            await send_msg(chat_id, "🚫 <b>បាន​បោះបង់​ការ​ផ្សាយ</b>", reply_markup=ADMIN_SETTINGS_KB)
-            message.stop_propagation()
-
-
-# ─── group 3: Admin email_delete_picker state ─────────────────────────────────
-@app.on_message(filters.private & email_delete_picker_filter, group=3)
-async def on_email_delete_picker(client, message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    text    = (message.text or "").strip()
-    async with get_user_lock(user_id):
-        if text == BTN_BACK_SETTINGS:
-            async with _data_lock:
-                user_sessions.pop(user_id, None)
-            asyncio.create_task(run_sync(_save_sessions))
-            await send_msg(chat_id, "📧 <b>ការគ្រប់គ្រងអ៊ីម៉ែល</b>\n\nជ្រើសរើសប្រតិបត្តិការ៖",
-                           reply_markup=EMAIL_SUBMENU_KB)
-            message.stop_propagation()
-            return
-        # Try to match tapped email address
-        entry = await run_sync(_email_history_get_by_email, user_id, text)
-        if not entry:
-            await send_msg(chat_id, "❌ មិនឃើញអ៊ីម៉ែលនេះទេ។", reply_markup=EMAIL_SUBMENU_KB)
-            async with _data_lock:
-                user_sessions.pop(user_id, None)
-            asyncio.create_task(run_sync(_save_sessions))
-            message.stop_propagation()
-            return
-        address_id = entry.get("address_id", "")
-        entry_id   = entry.get("id")
-        if address_id:
-            await run_sync(_dropmail_delete_address, address_id)
-        if entry_id:
-            await run_sync(_email_history_delete, entry_id)
-        async with _data_lock:
-            user_sessions.pop(user_id, None)
-        asyncio.create_task(run_sync(_save_sessions))
-        await send_msg(chat_id,
-                       f"✅ <b>លុបអ៊ីម៉ែលបានសម្រេច។</b>\n<code>{html.escape(text)}</code>",
-                       reply_markup=EMAIL_SUBMENU_KB)
-    message.stop_propagation()
-
-
-# ─── Email sub-menu helpers ───────────────────────────────────────────────────
+# ── 17. Email sub-menu helpers ────────────────────────────────────────────────
 async def _email_handle_new(chat_id: int, user_id: int):
     if not DROPMAIL_API_TOKEN:
         await send_msg(chat_id, "❌ DROPMAIL_API_TOKEN មិនទាន់កំណត់។", reply_markup=EMAIL_SUBMENU_KB)
@@ -2901,204 +2601,378 @@ async def _email_handle_delete_picker(chat_id: int, user_id: int):
     await send_msg(chat_id, "🗑 <b>ជ្រើសរើសអ៊ីម៉ែលដែលចង់លុប៖</b>", reply_markup=kb)
 
 
-# ─── group 4: Admin keyboard button labels ────────────────────────────────────
-@app.on_message(filters.private & admin_button_filter, group=4)
-async def on_admin_button(client, message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    btn     = (message.text or "").strip()
-    async with get_user_lock(user_id):
-        await _dispatch_admin_button(client, message, user_id, chat_id, btn)
-    message.stop_propagation()
-
-
-# ─── group 5: payment_pending message (anyone) ────────────────────────────────
-@app.on_message(filters.private & payment_pending_filter, group=5)
-async def on_payment_pending_msg(client, message):
-    await _notify_must_finish_order(message.chat.id)
-    message.stop_propagation()
-
-
-# ─── group 6: Admin account-management session states ─────────────────────────
-@app.on_message(filters.private & admin_filter, group=6)
-async def on_admin_session_message(client, message):
-    global accounts_data
-    user_id    = message.from_user.id
-    chat_id    = message.chat.id
-    message_id = message.id
-    text       = message.text or ""
-
-    async with get_user_lock(user_id):
-        async with _data_lock:
-            sess = user_sessions.get(user_id)
-        if not sess:
-            await show_account_selection(chat_id)
-            message.stop_propagation()
-            return
-
-        state = sess.get("state", "")
-
-        if state == "waiting_for_accounts":
-            email_pat = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-            accounts  = []
-            for line in text.strip().split("\n"):
-                em = line.strip()
-                if em and email_pat.match(em):
-                    accounts.append({"email": em})
-            async with _data_lock:
-                all_existing = {
-                    a.get("email", "").lower()
-                    for accs in accounts_data.get("account_types", {}).values()
-                    for a in accs if a.get("email")
-                }
-            seen, deduped, intra_dupes = set(), [], []
-            for a in accounts:
-                k = a.get("email", "").lower()
-                if k in seen:
-                    intra_dupes.append(a["email"])
-                else:
-                    seen.add(k)
-                    deduped.append(a)
-            stock_dupes = [a["email"] for a in deduped if a.get("email", "").lower() in all_existing]
-            new_accounts = [a for a in deduped if a.get("email", "").lower() not in all_existing]
-            if new_accounts:
-                warnings = []
-                if intra_dupes:
-                    warnings.append(f"⚠️ *អ៊ីមែលដដែល (រំលង)៖*\n```\n{chr(10).join(intra_dupes)}\n```")
-                if stock_dupes:
-                    warnings.append(f"⚠️ *អ៊ីមែលមានស្រាប់ (រំលង)៖*\n```\n{chr(10).join(stock_dupes)}\n```")
-                if warnings:
-                    await send_msg(chat_id, "\n\n".join(warnings), parse_mode=ParseMode.MARKDOWN)
-                async with _data_lock:
-                    sess["accounts"] = new_accounts
-                    sess["state"]    = "waiting_for_account_type"
-                asyncio.create_task(run_sync(_save_sessions))
-                await send_msg(chat_id,
-                               f"*បានបញ្ចូល គូប៉ុង ចំនួន {len(new_accounts)}\n\nសូមបញ្ចូលប្រភេទ គូប៉ុង៖*",
-                               parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
-            elif accounts:
-                all_d = intra_dupes + stock_dupes
-                await send_msg(chat_id,
-                               f"❌ *មិនអាចបញ្ចូលបាន!*\n\nអ៊ីមែលទាំងអស់ស្ទួន:\n```\n{chr(10).join(all_d)}\n```",
-                               parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
-            else:
-                await send_msg(chat_id,
-                               "*មិនរកឃើញអ៊ីមែលត្រឹមត្រូវ! ទម្រង់:*\n\n```\nl1jebywyzos2@10mail.info\n```",
-                               parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
-            message.stop_propagation()
-            return
-
-        if state == "waiting_for_account_type":
-            account_type_input = text.strip()
-            async with _data_lock:
-                existing_price = accounts_data.get("prices", {}).get(account_type_input)
-                sess["account_type"] = account_type_input
-                sess["state"]        = "waiting_for_price"
-            asyncio.create_task(run_sync(_save_sessions))
-            if existing_price is not None:
-                await send_msg(
-                    chat_id,
-                    f"*ប្រភេទ `{account_type_input}` មានស្រាប់ ដែលមានតម្លៃ {existing_price}$\n\n"
-                    f"តម្លៃត្រូវតែដូចគ្នា ({existing_price}$) ដើម្បីបន្ថែម គូប៉ុង:*",
-                    parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
-            else:
-                await send_msg(chat_id,
-                               f"*សូមដាក់តម្លៃក្នុងប្រភេទ គូប៉ុង {account_type_input}*",
-                               parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
-            message.stop_propagation()
-            return
-
-        if state == "waiting_for_price":
-            try:
-                price = float(text.strip().replace("$", ""))
-                account_type = sess["account_type"]
-                accs_to_add  = sess["accounts"]
-                async with _data_lock:
-                    existing_price = accounts_data.get("prices", {}).get(account_type)
-                    all_existing   = {
-                        a.get("email", "").lower()
-                        for pool in accounts_data.get("account_types", {}).values()
-                        for a in pool if a.get("email")
-                    }
-                if existing_price is not None and round(existing_price, 4) != round(price, 4):
-                    await send_msg(
-                        chat_id,
-                        f"❌ *មិនអាចបញ្ចូលបាន!*\n\nប្រភេទ `{account_type}` មានតម្លៃ *{existing_price}$* ស្រាប់។\n"
-                        f"តម្លៃ *{price}$* មិនដូចគ្នា។ សូមប្រើ *{existing_price}$*",
-                        parse_mode=ParseMode.MARKDOWN)
-                    message.stop_propagation()
-                    return
-                seen, deduped = set(), []
-                for a in accs_to_add:
-                    k = a.get("email", "").lower()
-                    if k not in seen:
-                        seen.add(k)
-                        deduped.append(a)
-                dup_emails  = [a["email"] for a in deduped if a.get("email", "").lower() in all_existing]
-                new_accounts = [a for a in deduped if a.get("email", "").lower() not in all_existing]
-                if dup_emails and not new_accounts:
-                    await send_msg(chat_id,
-                                   f"❌ *មិនអាចបញ្ចូលបាន!*\n\nEmail ទាំងអស់មានស្រាប់:\n```\n{chr(10).join(dup_emails)}\n```",
-                                   parse_mode=ParseMode.MARKDOWN)
-                    message.stop_propagation()
-                    return
-                if dup_emails:
-                    await send_msg(chat_id,
-                                   f"⚠️ *Email ខាងក្រោមមានស្រាប់ ហើយត្រូវបានរំលង:*\n```\n{chr(10).join(dup_emails)}\n```",
-                                   parse_mode=ParseMode.MARKDOWN)
-                async with _data_lock:
-                    accounts_data["accounts"].extend(new_accounts)
-                    if account_type in accounts_data["account_types"]:
-                        accounts_data["account_types"][account_type].extend(new_accounts)
-                    else:
-                        accounts_data["account_types"][account_type] = new_accounts
-                    accounts_data["prices"][account_type] = price
-                    user_sessions.pop(user_id, None)
-                asyncio.create_task(run_sync(_save_data))
-                asyncio.create_task(run_sync(_save_sessions))
-                await send_msg(
-                    chat_id,
-                    f"*✅ បានបញ្ចូល គូប៉ុង ដោយជោគជ័យ*\n\n"
-                    f"```\n🔹 ចំនួន: {len(new_accounts)}\n🔹 ប្រភេទ: {account_type}\n🔹 តម្លៃ: {price}$\n```",
-                    parse_mode=ParseMode.MARKDOWN)
-                logger.info(f"Admin {user_id} added {len(new_accounts)} accounts of type {account_type} @ ${price}")
-            except ValueError:
-                await send_msg(chat_id, "តម្លៃមិនត្រឹមត្រូវ។ សូមបញ្ចូលតម្លៃជាលេខ (ឧ: 5.99)")
-            message.stop_propagation()
-            return
-
-        # Unrecognized admin message — clear session + show selection
+async def _email_handle_delete_confirm(chat_id: int, user_id: int, email_address: str):
+    """Delete a specific email address from history."""
+    entry = await run_sync(_email_history_get_by_email, user_id, email_address)
+    if not entry:
+        await send_msg(chat_id, "❌ មិនឃើញអ៊ីម៉ែលនេះទេ។", reply_markup=EMAIL_SUBMENU_KB)
         async with _data_lock:
             user_sessions.pop(user_id, None)
         asyncio.create_task(run_sync(_save_sessions))
-        await show_account_selection(chat_id)
-        message.stop_propagation()
+        return
+    address_id = entry.get("address_id", "")
+    entry_id   = entry.get("id")
+    if address_id:
+        await run_sync(_dropmail_delete_address, address_id)
+    if entry_id:
+        await run_sync(_email_history_delete, entry_id)
+    async with _data_lock:
+        user_sessions.pop(user_id, None)
+    asyncio.create_task(run_sync(_save_sessions))
+    await send_msg(chat_id,
+                   f"✅ <b>លុបអ៊ីម៉ែលបានសម្រេច។</b>\n<code>{html.escape(email_address)}</code>",
+                   reply_markup=EMAIL_SUBMENU_KB)
 
 
-# ─── group 7: Non-admin fallback ──────────────────────────────────────────────
-@app.on_message(filters.private & ~admin_filter, group=7)
-async def on_buyer_message(client, message):
-    user = message.from_user
+# ── 18. Handlers ──────────────────────────────────────────────────────────────
+
+# ─── Channel post handler ──────────────────────────────────────────────────────
+async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message:
+        await handle_channel_post(message)
+    raise ApplicationHandlerStop
+
+
+# ─── /start command ────────────────────────────────────────────────────────────
+async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not user or not message:
+        return
     asyncio.create_task(
         notify_admin_new_user(user.id, user.first_name, user.last_name, user.username))
     async with get_user_lock(user.id):
-        await show_account_selection(message.chat.id)
+        if await _has_active_purchase(user.id):
+            await _notify_must_finish_order(message.chat_id)
+            return
+        await _reset_user_session(user.id)
+        logger.info(f"User {user.id} triggered account selection")
+        await show_account_selection(message.chat_id)
+
+
+# ─── /cancel command ───────────────────────────────────────────────────────────
+async def on_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not user or not message:
+        return
+    user_id = user.id
+    chat_id = message.chat_id
+    async with get_user_lock(user_id):
+        session = user_sessions.get(user_id) or await run_sync(_get_pending_payment, user_id)
+        if not session or session.get("state") not in ("waiting_for_quantity", "payment_pending"):
+            await show_account_selection(chat_id)
+            return
+        for key in ("photo_message_id", "qr_message_id", "dot_message_id"):
+            mid = session.get(key)
+            if mid:
+                asyncio.create_task(delete_msg(chat_id, mid))
+        await _reset_user_session(user_id)
+        await show_account_selection(chat_id)
+
+
+# ─── All private messages dispatcher ──────────────────────────────────────────
+async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Single dispatcher for all non-command private messages."""
+    message = update.effective_message
+    user = update.effective_user
+    if not user or not message:
+        return
+
+    uid = user.id
+    chat_id = message.chat_id
+    text = (message.text or "").strip()
+
+    # Maintenance block (non-admin)
+    if MAINTENANCE_MODE and not is_admin(uid):
+        await send_msg(chat_id, "🔧 <b>Bot កំពុង Update សូមរង់ចាំមួយភ្លែត...</b>")
+        return
+
+    asyncio.create_task(
+        notify_admin_new_user(uid, user.first_name, user.last_name, user.username))
+
+    async with get_user_lock(uid):
+        async with _data_lock:
+            sess = user_sessions.get(uid, {})
+        state = str(sess.get("state", ""))
+
+        # ── Admin dispatch ────────────────────────────────────────────────────
+        if is_admin(uid):
+            # Admin settings button
+            if text == ADMIN_SETTINGS_BTN:
+                if state.startswith("admin_input:"):
+                    async with _data_lock:
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_sessions))
+                await send_admin_settings_menu(chat_id)
+                return
+
+            # Admin pending input state
+            if state.startswith("admin_input:"):
+                key = state.split(":", 1)[1]
+                if await _handle_admin_settings_input(chat_id, uid, message.message_id, key, text):
+                    return
+
+            # Admin delete_type_select state
+            if state == "delete_type_select":
+                labels = sess.get("labels", {}) or {}
+                if text == BTN_BACK_SETTINGS:
+                    async with _data_lock:
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_sessions))
+                    await send_admin_settings_menu(chat_id)
+                    return
+                type_name = labels.get(text)
+                if type_name and type_name in accounts_data.get("account_types", {}):
+                    async with _data_lock:
+                        count = len(accounts_data["account_types"].get(type_name, []))
+                        price = accounts_data.get("prices", {}).get(type_name, 0)
+                        user_sessions[uid] = {"state": "delete_type_confirm", "type_name": type_name}
+                    asyncio.create_task(run_sync(_save_sessions))
+                    await send_msg(
+                        chat_id,
+                        f"⚠️ <b>តើអ្នកពិតជាចង់លុបប្រភេទ គូប៉ុង នេះមែនទេ?</b>\n\n"
+                        f"<blockquote>🔹 ប្រភេទ: {html.escape(type_name)}\n"
+                        f"🔹 ចំនួន: {count}\n🔹 តម្លៃ: ${price}</blockquote>",
+                        reply_markup=ReplyKeyboardMarkup([
+                            [KeyboardButton(BTN_DELETE_CONFIRM)],
+                            [KeyboardButton(BTN_DELETE_CANCEL)],
+                        ], resize_keyboard=True, is_persistent=True))
+                    return
+
+            # Admin delete_type_confirm state
+            if state == "delete_type_confirm":
+                type_name = sess.get("type_name")
+                if text == BTN_DELETE_CONFIRM:
+                    async with _data_lock:
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_sessions))
+                    if not type_name or type_name not in accounts_data.get("account_types", {}):
+                        await send_msg(chat_id, "⚠️ <b>ប្រភេទនេះមិនមានទៀតហើយ!</b>",
+                                       reply_markup=ADMIN_SETTINGS_KB)
+                        return
+                    async with _data_lock:
+                        count = len(accounts_data["account_types"].pop(type_name, []))
+                        accounts_data.get("prices", {}).pop(type_name, None)
+                        accounts_data["accounts"] = [
+                            a for a in accounts_data.get("accounts", []) if a.get("type") != type_name]
+                    asyncio.create_task(run_sync(_save_data))
+                    await send_msg(chat_id,
+                                   f"✅ <b>បានលុបប្រភេទ <code>{html.escape(type_name)}</code> ចំនួន {count} records!</b>",
+                                   reply_markup=ADMIN_SETTINGS_KB)
+                    logger.info(f"Admin {uid} deleted type '{type_name}' ({count} records)")
+                    return
+                elif text == BTN_DELETE_CANCEL:
+                    async with _data_lock:
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_sessions))
+                    await send_msg(chat_id, "🚫 <b>បានបោះបង់ការលុប</b>", reply_markup=ADMIN_SETTINGS_KB)
+                    return
+
+            # Admin broadcast_confirm state
+            if state == "broadcast_confirm":
+                if text == BTN_BROADCAST_CONFIRM:
+                    bcast_msg_id  = sess.get("broadcast_message_id")
+                    bcast_chat_id = sess.get("broadcast_chat_id") or chat_id
+                    use_copy      = bool(sess.get("broadcast_use_copy"))
+                    async with _data_lock:
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_sessions))
+                    if not bcast_msg_id:
+                        await send_msg(chat_id, "⚠️ មិន​ឃើញ​សារ​ដែល​ចង់​ផ្សាយ​ទេ",
+                                       reply_markup=ADMIN_SETTINGS_KB)
+                        return
+                    await send_msg(chat_id, "📢 កំពុង​ផ្សាយ​សារ ... សូមរង់ចាំ",
+                                   reply_markup=ADMIN_SETTINGS_KB)
+                    asyncio.create_task(_run_broadcast(bcast_chat_id, bcast_msg_id, use_copy))
+                    return
+                elif text == BTN_BROADCAST_CANCEL:
+                    async with _data_lock:
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_sessions))
+                    await send_msg(chat_id, "🚫 <b>បាន​បោះបង់​ការ​ផ្សាយ</b>", reply_markup=ADMIN_SETTINGS_KB)
+                    return
+
+            # Admin email_delete_picker state
+            if state == "email_delete_picker":
+                if text == BTN_BACK_SETTINGS:
+                    async with _data_lock:
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_sessions))
+                    await send_msg(chat_id, "📧 <b>ការគ្រប់គ្រងអ៊ីម៉ែល</b>\n\nជ្រើសរើសប្រតិបត្តិការ៖",
+                                   reply_markup=EMAIL_SUBMENU_KB)
+                    return
+                entry = await run_sync(_email_history_get_by_email, uid, text)
+                if entry:
+                    await _email_handle_delete_confirm(chat_id, uid, text)
+                    return
+                await send_msg(chat_id, "❌ មិនឃើញអ៊ីម៉ែលនេះទេ។", reply_markup=EMAIL_SUBMENU_KB)
+                async with _data_lock:
+                    user_sessions.pop(uid, None)
+                asyncio.create_task(run_sync(_save_sessions))
+                return
+
+            # Admin keyboard button labels
+            if text in ADMIN_BUTTON_LABELS:
+                await _dispatch_admin_button(bot, uid, chat_id, text)
+                return
+
+            # Admin account-management session states
+            if state == "waiting_for_accounts":
+                email_pat = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+                accounts  = []
+                for line in text.strip().split("\n"):
+                    em = line.strip()
+                    if em and email_pat.match(em):
+                        accounts.append({"email": em})
+                async with _data_lock:
+                    all_existing = {
+                        a.get("email", "").lower()
+                        for accs in accounts_data.get("account_types", {}).values()
+                        for a in accs if a.get("email")
+                    }
+                seen, deduped, intra_dupes = set(), [], []
+                for a in accounts:
+                    k = a.get("email", "").lower()
+                    if k in seen:
+                        intra_dupes.append(a["email"])
+                    else:
+                        seen.add(k)
+                        deduped.append(a)
+                stock_dupes = [a["email"] for a in deduped if a.get("email", "").lower() in all_existing]
+                new_accounts = [a for a in deduped if a.get("email", "").lower() not in all_existing]
+                if new_accounts:
+                    warnings = []
+                    if intra_dupes:
+                        warnings.append(f"⚠️ *អ៊ីមែលដដែល (រំលង)៖*\n```\n{chr(10).join(intra_dupes)}\n```")
+                    if stock_dupes:
+                        warnings.append(f"⚠️ *អ៊ីមែលមានស្រាប់ (រំលង)៖*\n```\n{chr(10).join(stock_dupes)}\n```")
+                    if warnings:
+                        await send_msg(chat_id, "\n\n".join(warnings), parse_mode=ParseMode.MARKDOWN)
+                    async with _data_lock:
+                        sess["accounts"] = new_accounts
+                        sess["state"]    = "waiting_for_account_type"
+                    asyncio.create_task(run_sync(_save_sessions))
+                    await send_msg(chat_id,
+                                   f"*បានបញ្ចូល គូប៉ុង ចំនួន {len(new_accounts)}\n\nសូមបញ្ចូលប្រភេទ គូប៉ុង៖*",
+                                   parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                elif accounts:
+                    all_d = intra_dupes + stock_dupes
+                    await send_msg(chat_id,
+                                   f"❌ *មិនអាចបញ្ចូលបាន!*\n\nអ៊ីមែលទាំងអស់ស្ទួន:\n```\n{chr(10).join(all_d)}\n```",
+                                   parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                else:
+                    await send_msg(chat_id,
+                                   "*មិនរកឃើញអ៊ីមែលត្រឹមត្រូវ! ទម្រង់:*\n\n```\nl1jebywyzos2@10mail.info\n```",
+                                   parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                return
+
+            if state == "waiting_for_account_type":
+                account_type_input = text.strip()
+                async with _data_lock:
+                    existing_price = accounts_data.get("prices", {}).get(account_type_input)
+                    sess["account_type"] = account_type_input
+                    sess["state"]        = "waiting_for_price"
+                asyncio.create_task(run_sync(_save_sessions))
+                if existing_price is not None:
+                    await send_msg(
+                        chat_id,
+                        f"*ប្រភេទ `{account_type_input}` មានស្រាប់ ដែលមានតម្លៃ {existing_price}$\n\n"
+                        f"តម្លៃត្រូវតែដូចគ្នា ({existing_price}$) ដើម្បីបន្ថែម គូប៉ុង:*",
+                        parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                else:
+                    await send_msg(chat_id,
+                                   f"*សូមដាក់តម្លៃក្នុងប្រភេទ គូប៉ុង {account_type_input}*",
+                                   parse_mode=ParseMode.MARKDOWN, reply_markup=ADD_ACCOUNT_KB)
+                return
+
+            if state == "waiting_for_price":
+                try:
+                    price = float(text.strip().replace("$", ""))
+                    account_type = sess["account_type"]
+                    accs_to_add  = sess["accounts"]
+                    async with _data_lock:
+                        existing_price = accounts_data.get("prices", {}).get(account_type)
+                        all_existing   = {
+                            a.get("email", "").lower()
+                            for pool in accounts_data.get("account_types", {}).values()
+                            for a in pool if a.get("email")
+                        }
+                    if existing_price is not None and round(existing_price, 4) != round(price, 4):
+                        await send_msg(
+                            chat_id,
+                            f"❌ *មិនអាចបញ្ចូលបាន!*\n\nប្រភេទ `{account_type}` មានតម្លៃ *{existing_price}$* ស្រាប់។\n"
+                            f"តម្លៃ *{price}$* មិនដូចគ្នា។ សូមប្រើ *{existing_price}$*",
+                            parse_mode=ParseMode.MARKDOWN)
+                        return
+                    seen, deduped = set(), []
+                    for a in accs_to_add:
+                        k = a.get("email", "").lower()
+                        if k not in seen:
+                            seen.add(k)
+                            deduped.append(a)
+                    dup_emails  = [a["email"] for a in deduped if a.get("email", "").lower() in all_existing]
+                    new_accounts = [a for a in deduped if a.get("email", "").lower() not in all_existing]
+                    if dup_emails and not new_accounts:
+                        await send_msg(chat_id,
+                                       f"❌ *មិនអាចបញ្ចូលបាន!*\n\nEmail ទាំងអស់មានស្រាប់:\n```\n{chr(10).join(dup_emails)}\n```",
+                                       parse_mode=ParseMode.MARKDOWN)
+                        return
+                    if dup_emails:
+                        await send_msg(chat_id,
+                                       f"⚠️ *Email ខាងក្រោមមានស្រាប់ ហើយត្រូវបានរំលង:*\n```\n{chr(10).join(dup_emails)}\n```",
+                                       parse_mode=ParseMode.MARKDOWN)
+                    async with _data_lock:
+                        accounts_data["accounts"].extend(new_accounts)
+                        if account_type in accounts_data["account_types"]:
+                            accounts_data["account_types"][account_type].extend(new_accounts)
+                        else:
+                            accounts_data["account_types"][account_type] = new_accounts
+                        accounts_data["prices"][account_type] = price
+                        user_sessions.pop(uid, None)
+                    asyncio.create_task(run_sync(_save_data))
+                    asyncio.create_task(run_sync(_save_sessions))
+                    await send_msg(
+                        chat_id,
+                        f"*✅ បានបញ្ចូល គូប៉ុង ដោយជោគជ័យ*\n\n"
+                        f"```\n🔹 ចំនួន: {len(new_accounts)}\n🔹 ប្រភេទ: {account_type}\n🔹 តម្លៃ: {price}$\n```",
+                        parse_mode=ParseMode.MARKDOWN)
+                    logger.info(f"Admin {uid} added {len(new_accounts)} accounts of type {account_type} @ ${price}")
+                except ValueError:
+                    await send_msg(chat_id, "តម្លៃមិនត្រឹមត្រូវ។ សូមបញ្ចូលតម្លៃជាលេខ (ឧ: 5.99)")
+                return
+
+            # Unrecognized admin message — show account selection
+            await show_account_selection(chat_id)
+            return
+
+        # ── Non-admin dispatch ────────────────────────────────────────────────
+        # Payment pending guard
+        if state == "payment_pending":
+            await _notify_must_finish_order(chat_id)
+            return
+
+        # Any other message → show account selection
+        await show_account_selection(chat_id)
 
 
 # ─── Callback query handler ───────────────────────────────────────────────────
-@app.on_callback_query(group=0)
-async def on_callback_query(client, callback_query):
-    user    = callback_query.from_user
+async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user  = update.effective_user
+    if not query or not user:
+        return
     user_id = user.id
-    chat_id = callback_query.message.chat.id
-    data    = callback_query.data or ""
+    chat_id = query.message.chat_id
+    data    = query.data or ""
     logger.info(f"Callback from {user.first_name} (ID:{user_id}): {data}")
 
     asyncio.create_task(
         notify_admin_new_user(user_id, user.first_name, user.last_name, user.username))
 
     async with get_user_lock(user_id):
-        await _handle_callback_locked(callback_query, user, user_id, chat_id, data)
+        await _handle_callback_locked(query, user, user_id, chat_id, data)
 
 
 async def _handle_callback_locked(cq, user, user_id, chat_id, data):
@@ -3137,7 +3011,7 @@ async def _handle_callback_locked(cq, user, user_id, chat_id, data):
             rows_inline.append([InlineKeyboardButton("🚫 បោះបង់", callback_data="cancel_buy")])
             await send_msg(chat_id, "<b>សូមជ្រើសរើសចំនួនដែលចង់ទិញ៖</b>",
                            reply_markup=InlineKeyboardMarkup(rows_inline))
-            asyncio.create_task(delete_msg(chat_id, cq.message.id))
+            asyncio.create_task(delete_msg(chat_id, cq.message.message_id))
             return
 
         # ── Out of stock ──────────────────────────────────────────────────────
@@ -3182,7 +3056,7 @@ async def _handle_callback_locked(cq, user, user_id, chat_id, data):
                 accounts_data["accounts"] = [
                     a for a in accounts_data.get("accounts", []) if a.get("type") != type_name]
             asyncio.create_task(run_sync(_save_data))
-            asyncio.create_task(delete_msg(chat_id, cq.message.id))
+            asyncio.create_task(delete_msg(chat_id, cq.message.message_id))
             await send_msg(chat_id,
                            f"✅ <b>បានលុប <code>{type_name}</code> ចំនួន {count} records!</b>")
             logger.info(f"Admin {user_id} deleted type '{type_name}'")
@@ -3190,7 +3064,7 @@ async def _handle_callback_locked(cq, user, user_id, chat_id, data):
 
         if data == "dtcancel" and is_admin(user_id):
             await cq.answer()
-            asyncio.create_task(delete_msg(chat_id, cq.message.id))
+            asyncio.create_task(delete_msg(chat_id, cq.message.message_id))
             await send_msg(chat_id, "🚫 <b>បានបោះបង់ការលុប</b>")
             return
 
@@ -3200,7 +3074,7 @@ async def _handle_callback_locked(cq, user, user_id, chat_id, data):
             async with _data_lock:
                 user_sessions.pop(user_id, None)
             asyncio.create_task(run_sync(_save_sessions))
-            asyncio.create_task(delete_msg(chat_id, cq.message.id))
+            asyncio.create_task(delete_msg(chat_id, cq.message.message_id))
             await show_account_selection(chat_id)
             return
 
@@ -3251,7 +3125,7 @@ async def _handle_callback_locked(cq, user, user_id, chat_id, data):
             async with _data_lock:
                 session["quantity"]    = quantity
                 session["total_price"] = quantity * session["price"]
-            asyncio.create_task(delete_msg(chat_id, cq.message.id))
+            asyncio.create_task(delete_msg(chat_id, cq.message.message_id))
             await _start_payment_for_session(chat_id, user_id, session, callback_query=cq)
             return
 
@@ -3322,15 +3196,13 @@ async def _handle_callback_locked(cq, user, user_id, chat_id, data):
             await show_account_selection(chat_id)
             return
 
-
     except Exception as e:
         logger.error(f"Callback handler error for user {user_id}: {e}")
 
 
 # ── 19. Background periodic sweeper ──────────────────────────────────────────
 async def _check_active_pending_payments():
-    """Check all non-expired pending payments against Bakong API and deliver accounts if paid.
-    This handles cases where the bot restarted and lost the in-memory QR expiry polling tasks."""
+    """Check all non-expired pending payments against Bakong API and deliver accounts if paid."""
     try:
         r = await run_sync(
             _neon_query,
@@ -3499,7 +3371,27 @@ async def _resume_scheduled_deletions():
         logger.error(f"Failed to resume scheduled deletions: {e}")
 
 
-# ── 20. Startup sequence ──────────────────────────────────────────────────────
+# ── 20. Handler registration ──────────────────────────────────────────────────
+def _register_handlers(app: Application):
+    # Channel posts (highest priority)
+    app.add_handler(
+        MessageHandler(filters.ChatType.CHANNEL, on_channel_post),
+        group=-10)
+
+    # /start and /cancel commands
+    app.add_handler(CommandHandler("start", on_start), group=0)
+    app.add_handler(CommandHandler("cancel", on_cancel), group=0)
+
+    # All non-command private messages (single dispatcher)
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_private_message),
+        group=0)
+
+    # Callback queries
+    app.add_handler(CallbackQueryHandler(on_callback_query), group=0)
+
+
+# ── 21. Startup sequence ──────────────────────────────────────────────────────
 async def _on_startup():
     global accounts_data, PAYMENT_NAME, MAINTENANCE_MODE, CHANNEL_ID
     global BAKONG_TOKEN, BAKONG_RELAY_TOKEN, BAKONG_API_TOKEN, khqr_client, EXTRA_ADMIN_IDS
@@ -3557,6 +3449,7 @@ async def _on_startup():
 
     _sv = await run_sync(_get_setting, "DROPMAIL_API_TOKEN")
     if _sv:
+        global DROPMAIL_API_TOKEN, _DROPMAIL_URL
         DROPMAIL_API_TOKEN = _sv
         _DROPMAIL_URL = f"https://dropmail.me/api/graphql/{DROPMAIL_API_TOKEN}"
         logger.info(f"Loaded DROPMAIL_API_TOKEN from DB: {DROPMAIL_API_TOKEN[:6]}…")
@@ -3583,31 +3476,60 @@ async def _on_startup():
         except Exception as _e:
             logger.error(f"Clone bot auto-start failed: {_e}")
 
-    me = await app.get_me()
+    me = await bot.get_me()
     logger.info(f"Bot connected: @{me.username}")
-
-    # Drain any pending Bot API HTTP queue so Pyrogram MTProto can receive
-    # new updates cleanly (stale queued updates block MTProto delivery).
-    await run_sync(_drain_bot_api_queue)
-    logger.info("Bot is now listening for updates (Pyrogram MTProto)...")
-
+    logger.info("Bot is now listening for updates (Bot API polling)...")
 
 
 # ── 22. Main ──────────────────────────────────────────────────────────────────
 async def _run():
-    await app.start()
-    try:
+    global application, bot
+
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    bot = application.bot
+
+    _register_handlers(application)
+
+    stop_event = asyncio.Event()
+
+    async with application:
+        await application.start()
         await _on_startup()
-        await idle()
-    finally:
-        if admin_clone_app is not None:
+        await application.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True)
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
             try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except NotImplementedError:
+                pass
+
+        logger.info("Bot running. Press Ctrl+C to stop.")
+        await stop_event.wait()
+
+        logger.info("Shutdown signal received, stopping...")
+
+        # Stop clone bot
+        if admin_clone_task and not admin_clone_task.done():
+            admin_clone_task.cancel()
+            try:
+                await admin_clone_task
+            except Exception:
+                pass
+        if admin_clone_app:
+            try:
+                await admin_clone_app.updater.stop()
                 await admin_clone_app.stop()
+                await admin_clone_app.shutdown()
                 logger.info("Admin clone bot stopped on shutdown.")
             except Exception as _e:
                 logger.warning(f"Clone bot stop on shutdown: {_e}")
-        await app.stop()
+
+        await application.updater.stop()
+        await application.stop()
 
 
 if __name__ == "__main__":
-    app.run(_run())
+    asyncio.run(_run())
